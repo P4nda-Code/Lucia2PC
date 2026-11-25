@@ -1433,15 +1433,18 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
 /// nothing returned.
 extern "system" fn ignored_state(_: This) {}
 
-/// Depth bounds `(min, max)`.
-/// shortcut: not set on the host list (no host pipeline of ours enables
-/// the test, `pipeline::host`); the first values are logged, so a run
-/// shows whether the title uses the test at all.
-extern "system" fn depth_bounds(_: This, min: f32, max: f32) {
-    static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
-        tracing::info!(min, max, "the title sets depth bounds, which the host is not given");
-    }
+/// Depth bounds `(min, max)`, preserved in title command-list order.
+extern "system" fn depth_bounds(this: This, min: f32, max: f32) {
+    #[cfg(windows)]
+    with_state(this, |host, _| {
+        use windows::core::Interface;
+        match host.list.cast::<windows::Win32::Graphics::Direct3D12::ID3D12GraphicsCommandList1>() {
+            Ok(list) => unsafe { list.OMSetDepthBounds(min, max) },
+            Err(error) => tracing::warn!(%error, "host command list cannot set depth bounds"),
+        }
+    });
+    #[cfg(not(windows))]
+    let _ = (this, min, max);
 }
 
 /// The title's draw state (decision 0007, step 3), kept for its draws or

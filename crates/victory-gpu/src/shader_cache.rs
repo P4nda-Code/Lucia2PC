@@ -62,6 +62,7 @@ fn build() -> &'static [u8; 32] {
                 // executable had cached with the switch unset.
                 for name in [
                     "VICTORY_WAVE_WIDE",
+                    "VICTORY_WAVE_WIDE_ONLY",
                     "VICTORY_WAVE_DEEP_SKIPS",
                     "VICTORY_WAVE_OWN_BITS",
                     "VICTORY_F16_NEAREST",
@@ -92,11 +93,44 @@ fn build() -> &'static [u8; 32] {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    let translate = translate_listed;
     match CACHE.get() {
         Some(cache) => cached(cache, build(), container, translate),
         None => translate(container),
     }
+}
+
+/// Wave64 compute programs whose 64-lane form the D3D12 driver refuses on
+/// this title. The wave-wide form is attempted only after exact forms fail.
+static WAVE_WIDE: OnceLock<Vec<String>> = OnceLock::new();
+const WAVE_WIDE_DEFAULT: [&str; 5] = [
+    "5dc3b25986622949",
+    "6f225b641c5b0708",
+    "369cbe906ea72764",
+    "2cc4c197ee29e291",
+    "02384a60fda6f2d0",
+];
+
+fn wave_wide_listed(hash: &str, listed: &[String]) -> bool {
+    listed.iter().any(|listed| hash.starts_with(listed))
+}
+
+fn translate_listed(container: &[u8]) -> Result<HostShader, String> {
+    let list = WAVE_WIDE.get_or_init(|| match std::env::var("VICTORY_WAVE_WIDE_ONLY") {
+        Ok(value) => value
+            .split(',')
+            .map(|hash| hash.trim().to_ascii_lowercase())
+            .filter(|hash| !hash.is_empty() && hash != "none")
+            .collect(),
+        Err(_) => WAVE_WIDE_DEFAULT
+            .iter()
+            .map(|hash| (*hash).to_owned())
+            .collect(),
+    });
+    let hash = blake3::hash(container).to_hex();
+    let wide = wave_wide_listed(&hash, list);
+    victory_shader::emit::with_wave_wide(wide, || victory_shader::emit::translate(container))
+        .map_err(|error| error.to_string())
 }
 
 /// The cache entry's converter: the build and the container in, the
@@ -116,8 +150,10 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
-        let shader = (self.translate)(&input[32..]).map_err(anyhow::Error::msg)?;
-        Ok(encode(&shader))
+        Ok(match (self.translate)(&input[32..]) {
+            Ok(shader) => encode(&shader),
+            Err(error) => encode_error(&error),
+        })
     }
 }
 
@@ -136,7 +172,7 @@ fn cached(
         let path = cache
             .get_or_convert(&converter, &input)
             .map_err(|e| format!("{e:#}"))?;
-        if let Some(shader) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
+        if let Some(result) = std::fs::read(&path).ok().and_then(|b| decode_entry(&b)) {
             let (counter, what) = if converter.ran.load(Ordering::Relaxed) {
                 (&MISSES, "translated and cached")
             } else {
@@ -144,7 +180,7 @@ fn cached(
             };
             counter.fetch_add(1, Ordering::Relaxed);
             tracing::debug!(path = %path.display(), "shader {what}");
-            return Ok(shader);
+            return result;
         }
         tracing::debug!(path = %path.display(), "unreadable shader cache entry; translating again");
         let _ = std::fs::remove_file(&path);
@@ -154,6 +190,7 @@ fn cached(
 }
 
 const MAGIC: &[u8; 4] = b"VSH1";
+const ERROR_MAGIC: &[u8; 4] = b"VSE1";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -247,6 +284,19 @@ fn encode(s: &HostShader) -> Vec<u8> {
     out
 }
 
+fn encode_error(error: &str) -> Vec<u8> {
+    let mut out = ERROR_MAGIC.to_vec();
+    out.extend_from_slice(error.as_bytes());
+    out
+}
+
+fn decode_entry(bytes: &[u8]) -> Option<Result<HostShader, String>> {
+    if bytes.starts_with(ERROR_MAGIC) {
+        return Some(Err(String::from_utf8(bytes[4..].to_vec()).ok()?));
+    }
+    decode(bytes).map(Ok)
+}
+
 fn decode(bytes: &[u8]) -> Option<HostShader> {
     struct Reader<'a>(&'a [u8]);
     impl<'a> Reader<'a> {
@@ -329,6 +379,21 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn wave_wide_defaults_cover_the_captured_32_lane_failures() {
+        let defaults = WAVE_WIDE_DEFAULT.map(|hash| hash.to_owned());
+        for hash in [
+            "369cbe906ea72764",
+            "2cc4c197ee29e291",
+            "02384a60fda6f2d0",
+            "5dc3b25986622949",
+            "6f225b641c5b0708",
+        ] {
+            assert!(wave_wide_listed(hash, &defaults), "{hash}");
+        }
+        assert!(!wave_wide_listed("2da4beb386509b77", &defaults));
+    }
+
     fn shader() -> HostShader {
         HostShader {
             stage: HwStage::Ps,
@@ -387,9 +452,24 @@ mod tests {
         assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 3);
 
-        // Failures are not stored.
+        // Deterministic translation failures are cached too; shader input
+        // and translator build are part of the content-addressed key.
         let fail = |_: &[u8]| Err::<HostShader, _>("unsupported".to_owned());
         assert!(cached(&cache, &build, b"other", fail).is_err());
+        let calls = AtomicU64::new(0);
+        let fail = |_: &[u8]| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Err::<HostShader, _>("unsupported".to_owned())
+        };
+        assert_eq!(
+            cached(&cache, &build, b"failed", fail),
+            Err("unsupported".to_owned())
+        );
+        assert_eq!(
+            cached(&cache, &build, b"failed", fail),
+            Err("unsupported".to_owned())
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {

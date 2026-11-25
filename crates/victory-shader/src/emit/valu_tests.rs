@@ -383,6 +383,34 @@ fn max_and_min_order_negative_zero_below_positive_zero() {
 }
 
 #[test]
+fn v_permlane16_and_x16_read_the_selected_lanes() {
+    let selectors: [(u32, u32); 3] = [
+        (0x7654_3210, 0xfedc_ba98),
+        (0x89ab_cdef, 0x0123_4567),
+        (0x1111_1111, 0xf0f0_f0f0),
+    ];
+    for (opcode, cross) in [(0x377u16, false), (0x378, true)] {
+        for read in [0u8, 5, 15, 16, 22, 31] {
+            let mut body = vop3(opcode, 1, vgpr(0), sgpr(0), sgpr(1)).to_vec();
+            body.extend_from_slice(&vop3(0x360, 12, vgpr(1), 128 + u16::from(read), 0));
+            body.push(vop1(0x001, 0, sgpr(12)));
+            let shader = build_cs(&body, 32, 0);
+            let inputs: Vec<[u32; 4]> = selectors.iter().map(|&(a, b)| [a, b, 0, 0]).collect();
+            run_cases_on(&shader, &inputs, &[("hardware", false)], |backend, i, inp, got| {
+                let packed = u64::from(inp[0]) | (u64::from(inp[1]) << 32);
+                let pick = ((packed >> (4 * u32::from(read & 15))) & 15) as u32;
+                let row = if cross {
+                    (u32::from(read) & !31) | ((u32::from(read) & 16) ^ 16)
+                } else {
+                    u32::from(read) & !15
+                };
+                assert_eq!(got, row | pick, "{backend}: opcode {opcode:#x}, lane {read}, selectors {i}");
+            });
+        }
+    }
+}
+
+#[test]
 fn v_med3_f16_matches_rdna2_with_nan() {
     // v_med3_f16 v0, v1, v2, v3 (VOP3 opcode 0x357)
     let shader = build_valu_cs(&vop3(0x357, 0, vgpr(1), vgpr(2), vgpr(3)));

@@ -16,6 +16,10 @@ use crate::{io, ir, resource, structure};
 /// s0 (textures, or with `buffers` structured buffers of dwords, at entries
 /// 0 and 1, a raw UAV at entry 2) and the table of samplers at s1.
 fn build(words: &[u32], buffers: bool) -> HostShader {
+    build_with(words, buffers, 1)
+}
+
+fn build_with(words: &[u32], buffers: bool, nonuniform: u32) -> HostShader {
     let table = |user_data: u8| RootParam {
         root: RootType::Table,
         table_offset_dwords: 0,
@@ -72,8 +76,8 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
     })
     .expect("lower");
     // One access with each lane's own heap index, no wave operation.
-    assert_eq!(lowered.nonuniform_handles, 1);
-    assert!(!lowered.wave_ops);
+    assert_eq!(lowered.nonuniform_handles, nonuniform);
+    assert_eq!(lowered.wave_ops, nonuniform == 0);
     let shader = HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
@@ -92,6 +96,24 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         eprintln!("no dxil.dll; validation skipped");
     }
     shader
+}
+
+/// A console waterfall whose 8-dword texture descriptor is read for its
+/// dimensions but never used by an image instruction. This is the shape of
+/// the descriptor-only failures in the captured pixel shader logs.
+const WATERFALL_SIZE_ONLY_WAVE32: &[u32] = &[
+    0xBE84_0300, 0xBE85_0380, 0xF408_0A02, 0xFA00_0040, 0x3420_0082, 0x360E_0081,
+    0x340E_0E85, 0xBF8C_C07F, 0xBE97_037E, 0xBE95_037E, 0x7E28_0507, 0x7DA4_0E14,
+    0xF40C_0302, 0x2800_0000, 0xBF8C_C07F, 0xD54E_0001, 0x0278_1A0E, 0xBE95_4715,
+    0xBF89_FFF7, 0xBEFE_0317, 0xE070_1000, 0x800A_0110, 0xBF81_0000,
+];
+
+#[test]
+fn descriptor_only_texture_dimensions_lower_from_the_table_range() {
+    // The translation itself is the assertion: without table-based kind
+    // inference lower() refuses this shader as "descriptor read only as data".
+    let shader = build_with(WATERFALL_SIZE_ONLY_WAVE32, false, 0);
+    assert!(!shader.dxil.is_empty());
 }
 
 /// Runs `shader` with `views` at heap indices 0.. (the UAV last) on the

@@ -12,8 +12,9 @@
 //! bake) are there at once as before; past the budget a draw or dispatch
 //! whose pipeline is not ready is dropped, as an untranslated one is.
 //!
-//! The default budget is half a second per title frame. A pass the title
-//! runs only once and whose pipeline takes longer is lost.
+//! The default budget is half a second per title frame. During world loading,
+//! a longer bounded wait is allowed for pipelines that can be needed by
+//! one-time compute passes; otherwise those passes can be lost.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -42,6 +43,10 @@ unsafe impl Send for Pending {}
 unsafe impl Sync for Pending {}
 
 impl Pending {
+    fn computes(&self) -> bool {
+        compute_stage(self.shaders.iter().map(|shader| shader.stage))
+    }
+
     pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
         let mut key = blake3::Hasher::new();
         for s in &shaders {
@@ -66,6 +71,11 @@ impl Pending {
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
     }
+}
+
+fn compute_stage<'a>(stages: impl Iterator<Item = &'a str>) -> bool {
+    let mut stages = stages;
+    matches!((stages.next(), stages.next()), (Some("compute"), None))
 }
 
 /// Why a pipeline has no host pipeline (diagnostics): its shaders that do
@@ -159,29 +169,90 @@ fn shared_budget() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
 }
 
+/// Longer waits are limited while the title builds a world. Compute passes
+/// unpacking world data are commonly dispatched only once; graphics draws
+/// are usually retried by later frames, so their bound stays shorter.
+const LOADING_GRAPHICS_FRAME: Duration = Duration::from_secs(4);
+const LOADING_COMPUTE_FRAME: Duration = Duration::from_secs(12);
+
+fn loading_budget() -> Duration {
+    static BUDGET: OnceLock<Duration> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let seconds = std::env::var("VICTORY_PIPELINE_GATE_S")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(120);
+        Duration::from_secs(seconds)
+    })
+}
+
+/// Atomically reserve some of the run-wide extra wait budget. The reservation
+/// is released for any part of the wait that was not actually used.
+fn reserve_extra(used: &AtomicU64, cap: u64, requested: u64) -> u64 {
+    let mut current = used.load(Ordering::Relaxed);
+    loop {
+        let reserved = requested.min(cap.saturating_sub(current));
+        match used.compare_exchange_weak(
+            current,
+            current + reserved,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return reserved,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
-    let budget = wait_budget();
-    if budget.is_zero() {
+    let base = wait_budget();
+    if base.is_zero() {
         return;
     }
-    // The frame the budget belongs to, and what was waited of it (or is
-    // taken by a thread waiting now).
-    static SPENT: Mutex<(u64, Duration)> = Mutex::new((u64::MAX, Duration::ZERO));
+    // Pipeline compilation can be parallel across the title's recording
+    // threads. Keep separate per-frame budgets for graphics and compute, but
+    // bound their combined extension across the run.
+    static SPENT: [Mutex<(u64, Duration)>; 2] = [
+        const { Mutex::new((u64::MAX, Duration::ZERO)) },
+        const { Mutex::new((u64::MAX, Duration::ZERO)) },
+    ];
+    static EXTRA_USED_MS: AtomicU64 = AtomicU64::new(0);
+    let kind = usize::from(p.computes());
+    let frame_budget = if kind == 1 {
+        LOADING_COMPUTE_FRAME
+    } else {
+        LOADING_GRAPHICS_FRAME
+    };
     let shared = shared_budget();
-    let left = {
-        let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
+    let spent_for_frame = &SPENT[kind];
+    let (base_left, max_left) = {
+        let mut spent = spent_for_frame.lock().unwrap_or_else(|e| e.into_inner());
         if spent.0 != frame {
             *spent = (frame, Duration::ZERO);
         }
-        let left = budget.saturating_sub(spent.1);
+        let base_left = base.saturating_sub(spent.1);
+        let max_left = frame_budget.saturating_sub(spent.1);
         if shared {
-            spent.1 += left;
+            spent.1 = spent.1.saturating_add(base_left);
         }
-        left
+        (base_left, max_left)
     };
+    let requested_extra = max_left.saturating_sub(base_left);
+    let cap_ms = loading_budget().as_millis().min(u64::MAX as u128) as u64;
+    let requested_ms = requested_extra.as_millis().min(u64::MAX as u128) as u64;
+    let reserved_ms = reserve_extra(&EXTRA_USED_MS, cap_ms, requested_ms);
+    let extra = Duration::from_millis(reserved_ms);
+    let left = base_left.saturating_add(extra);
     if left.is_zero() {
+        EXTRA_USED_MS.fetch_sub(reserved_ms, Ordering::Relaxed);
         return;
+    }
+    if shared && !extra.is_zero() {
+        let mut spent = spent_for_frame.lock().unwrap_or_else(|e| e.into_inner());
+        if spent.0 == frame {
+            spent.1 = spent.1.saturating_add(extra);
+        }
     }
     let started = Instant::now();
     let (lock, done) = &DONE;
@@ -191,12 +262,15 @@ fn wait(p: &Pending, frame: u64) {
         if rest.is_zero() {
             break;
         }
-        held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
+        held = done
+            .wait_timeout(held, rest)
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
     }
     drop(held);
     let waited = started.elapsed().min(left);
     {
-        let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
+        let mut spent = spent_for_frame.lock().unwrap_or_else(|e| e.into_inner());
         // A frame that began meanwhile has its own budget.
         if spent.0 == frame {
             if shared {
@@ -206,6 +280,11 @@ fn wait(p: &Pending, frame: u64) {
             }
         }
     }
+    let used_extra_ms = waited
+        .saturating_sub(base_left)
+        .as_millis()
+        .min(reserved_ms as u128) as u64;
+    EXTRA_USED_MS.fetch_sub(reserved_ms - used_extra_ms, Ordering::Relaxed);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(
         crate::copystat::C::PipelineWaitUs,
@@ -348,6 +427,24 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extra_pipeline_wait_reservation_never_exceeds_run_cap() {
+        let used = AtomicU64::new(0);
+        assert_eq!(reserve_extra(&used, 1_000, 800), 800);
+        assert_eq!(reserve_extra(&used, 1_000, 500), 200);
+        assert_eq!(used.load(Ordering::Relaxed), 1_000);
+        used.fetch_sub(300, Ordering::Relaxed);
+        assert_eq!(reserve_extra(&used, 1_000, 500), 300);
+        assert_eq!(used.load(Ordering::Relaxed), 1_000);
+    }
+
+    #[test]
+    fn only_a_single_compute_stage_gets_the_longer_loading_budget() {
+        assert!(compute_stage(["compute"].into_iter()));
+        assert!(!compute_stage(["vertex", "pixel"].into_iter()));
+        assert!(!compute_stage(std::iter::empty()));
+    }
 
     /// A first use queues the pipeline and, within the budget, gets the
     /// worker's answer (here: no host pipeline for no shaders).

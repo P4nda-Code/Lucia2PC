@@ -1261,6 +1261,7 @@ impl<'a> Lower<'a> {
             console_lanes = insts().any(|i| {
                 let n = i.name();
                 n.starts_with("ds_swizzle")
+                    || n.starts_with("v_permlane")
                     || n.contains("permute")
                     || n.starts_with("v_mbcnt")
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
@@ -5530,7 +5531,48 @@ impl<'a> Lower<'a> {
                 .find_map(|(s, _)| use_of(*s))
         };
         let use_at = use_of(site).or_else(twin);
-        let Some((at, first)) = use_at else {
+        let (src, first, uav, props, image) = match use_at {
+            Some((at, first)) => {
+                let src = Source::Loaded { load: site, first };
+                let used = self.used_kind(&src);
+                let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
+                let un = ui.name();
+                let uav = un.contains("store")
+                    || un.contains("atomic")
+                    || used.is_some_and(|u| u.kind == ResourceType::Uav);
+                let u = if uav { 0x1000 } else { 0 };
+                let (props, image) = match &ui.fields {
+                    Fields::Image { .. } if un.starts_with("image_bvh") => ((11, 0), None),
+                    Fields::Image { dim, .. } => {
+                        let kind = match dim {
+                            0 => 1, 1 => 2, 2 => 4, 4 => 6, 5 => 7,
+                            _ => return Err("an image dimension (cube or MSAA)"),
+                        };
+                        ((kind | u, 0x409), Some(kind))
+                    }
+                    Fields::Buffer { idxen, format, .. } => {
+                        let stride = used.map_or(0, |u| u.stride);
+                        let props = if un.starts_with("buffer_load_format") || un.starts_with("buffer_store_format") {
+                            (10 | u, 0x409)
+                        } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4) {
+                            (12 | u, stride)
+                        } else { (11 | u, 0) };
+                        if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
+                            self.stale.extend(inst.writes.iter().map(|w| w.1));
+                            return Err("a constant buffer's descriptor read as data");
+                        }
+                        (props, None)
+                    }
+                    Fields::Smem { .. } if used.is_some_and(|u| u.kind == ResourceType::Srv) => ((11, 0), None),
+                    Fields::Smem { .. } => {
+                        self.stale.extend(inst.writes.iter().map(|w| w.1));
+                        return Err("a constant buffer's descriptor read as data");
+                    }
+                    _ => return Err("a scalar memory read as data"),
+                };
+                (src, first, uav, props, image)
+            }
+            None => {
             // A descriptor kept per lane in VGPRs (`Resources::lane_copied`): the code only
             // copies its dwords and compares them, lane against first lane, and every load
             // that reaches those lanes reads one address. Each dword stands in as its place
@@ -5578,58 +5620,71 @@ impl<'a> Lower<'a> {
                 }
                 return Ok(());
             }
-            return Err("a descriptor read only as data");
-        };
-        let src = Source::Loaded { load: site, first };
-        let used = self.used_kind(&src);
-        let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
-        let un = ui.name();
-        let uav = un.contains("store")
-            || un.contains("atomic")
-            || used.is_some_and(|u| u.kind == ResourceType::Uav);
-        let u = if uav { 0x1000 } else { 0 };
-        let (props, image) = match &ui.fields {
-            // A ray-tracing structure in a buffer of the host: read raw.
-            Fields::Image { .. } if un.starts_with("image_bvh") => ((11, 0), None),
-            Fields::Image { dim, .. } => {
-                let kind = match dim {
-                    0 => 1,
-                    1 => 2,
-                    2 => 4,
-                    4 => 6,
-                    5 => 7,
-                    _ => return Err("an image dimension (cube or MSAA)"),
-                };
-                ((kind | u, 0x409), Some(kind))
-            }
-            Fields::Buffer { idxen, format, .. } => {
-                let stride = used.map_or(0, |u| u.stride);
-                let props = if un.starts_with("buffer_load_format")
-                    || un.starts_with("buffer_store_format")
-                {
-                    (10 | u, 0x409)
-                } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4) {
-                    (12 | u, stride)
-                } else {
-                    (11 | u, 0)
-                };
-                if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
-                    self.stale.extend(inst.writes.iter().map(|w| w.1));
-                    return Err("a constant buffer's descriptor read as data");
+                const NONE: Why = "a descriptor read only as data";
+                let src = Source::Loaded { load: site, first: 0 };
+                let used = self.used_kind(&src);
+                if used.is_some_and(|u| {
+                    !matches!(u.kind, ResourceType::Srv | ResourceType::Uav)
+                }) {
+                    return Err(NONE);
                 }
-                (props, None)
+                let in_views = self
+                    .scalar
+                    .get(&site)
+                    .and_then(|a| self.x.native.layout.get(a.param))
+                    .is_some_and(|rp| {
+                        matches!(rp.root, RootType::Table | RootType::ResourceHeap)
+                    });
+                let reads_record_count = count >= 3
+                    && inst.write(Reg::S(code + 2)).is_some_and(|value| {
+                        self.x
+                            .p
+                            .blocks
+                            .iter()
+                            .flat_map(|block| &block.insts)
+                            .any(|reader| reader.reads.iter().any(|read| read.1 == value))
+                    });
+                let uav = used.is_some_and(|u| u.kind == ResourceType::Uav);
+                let u = if uav { 0x1000 } else { 0 };
+                let (props, image) = match (used.map(|u| u.dwords), count, reads_record_count) {
+                    // GFX10 image views have eight dwords. A shader that only
+                    // asks for dimensions still exposes that shape in its
+                    // scalar load (or the native UsedResource metadata).
+                    (Some(8), 8, _) => ((2 | u, 0x409), Some(2)),
+                    (None, 8, _) if in_views => ((2 | u, 0x409), Some(2)),
+                    // Four-dword views are buffers. With native metadata the
+                    // stride distinguishes structured views from raw/typed
+                    // views. Without it, infer a raw view only when the code
+                    // actually consumes dword 2, its record-count field.
+                    (Some(4), 4, _) => {
+                        let stride = used.map_or(0, |u| u.stride);
+                        let props = if stride >= 4 && stride.is_multiple_of(4) {
+                            (12 | u, stride)
+                        } else {
+                            (11 | u, 0)
+                        };
+                        (props, None)
+                    }
+                    (None, 4, true) if in_views => ((11 | u, 0), None),
+                    _ => {
+                        if std::env::var_os("VICTORY_DESC_WHY").is_some() {
+                            let address = self.scalar.get(&site).copied();
+                            let root = address
+                                .and_then(|a| self.x.native.layout.get(a.param))
+                                .map(|p| p.root);
+                            eprintln!(
+                                "DESC-WHY {:#x} {} descriptor-only load: address={address:?} root={root:?} used={used:?} dwords={count} reads_dword2={reads_record_count}",
+                                inst.machine.offset,
+                                inst.name(),
+                            );
+                        }
+                        return Err(NONE);
+                    }
+                };
+                (src, 0, uav, props, image)
             }
-            // Read by scalar buffer loads alone: the raw view `smem` reads it through.
-            Fields::Smem { .. } if used.is_some_and(|u| u.kind == ResourceType::Srv) => {
-                ((11, 0), None)
-            }
-            // A constant buffer: nothing of its descriptor is a number.
-            Fields::Smem { .. } => {
-                self.stale.extend(inst.writes.iter().map(|w| w.1));
-                return Err("a constant buffer's descriptor read as data");
-            }
-            _ => return Err("a scalar memory read as data"),
         };
+        let used = self.used_kind(&src);
         let h = self.handle(site, &src, false, props)?;
         let c = self.cur;
         let i32t = self.s.t.i32;
@@ -5712,6 +5767,14 @@ impl<'a> Lower<'a> {
                 Some(&(_, x)) => self.write(inst, Reg::S(code + k as u8), x, None),
                 None => {
                     if let Some(v) = inst.write(Reg::S(code + k as u8)) {
+                        if std::env::var_os("VICTORY_DESC_WHY").is_some() {
+                            eprintln!(
+                                "DESC-WHY {:#x} {} descriptor dword {} has no host equivalent",
+                                inst.machine.offset,
+                                inst.name(),
+                                k + u32::from(first),
+                            );
+                        }
                         self.vals.insert(v, Val::Missing(OTHER));
                         self.stale.insert(v);
                     }
@@ -6526,6 +6589,48 @@ impl<'a> Lower<'a> {
             return self.packed16(inst, op, guard);
         }
         match name {
+            "v_permlane16_b32" | "v_permlanex16_b32" => {
+                // Each lane reads src0 from a lane in its own 32-lane half.
+                // The 4-bit selector for this lane is packed into src1/src2;
+                // permlane16 selects within its 16-lane row and permlanex16
+                // selects the corresponding lane in the other row. Both
+                // operations stay within a 32-lane half, including when a
+                // console wave64 program is run as two host waves on NVIDIA.
+                // If the selected lane is inactive, the hardware keeps the
+                // old destination (the inactive-fetch modifier is not used by
+                // this shader form).
+                self.cross_lane(false)?;
+                let x = s(self, 0)?;
+                let (selectors_lo, selectors_hi) = (s(self, 1)?, s(self, 2)?);
+                let lane = self.s.op(c, "waveGetLaneIndex", Attr::ReadOnly, self.s.t.i32, 111, &[]);
+                let [k15, k8, k7, k2, k16, not31, not15] =
+                    [15, 8, 7, 2, 16, !31, !15].map(|n| self.s.m.i32(n));
+                let selector_index = self.s.m.bin(c, Bin::And, lane, k15);
+                let from_hi = self.s.m.cmp(c, pred::IUGE, selector_index, k8);
+                let selectors = self.s.m.select(c, from_hi, selectors_hi, selectors_lo);
+                let shift_index = self.s.m.bin(c, Bin::And, selector_index, k7);
+                let shift = self.s.m.bin(c, Bin::Shl, shift_index, k2);
+                let selector = self.s.m.bin(c, Bin::LShr, selectors, shift);
+                let selector = self.s.m.bin(c, Bin::And, selector, k15);
+                let row = if name == "v_permlanex16_b32" {
+                    let half = self.s.m.bin(c, Bin::And, lane, not31);
+                    let row = self.s.m.bin(c, Bin::And, lane, k16);
+                    let row = self.s.m.bin(c, Bin::Xor, row, k16);
+                    self.s.m.bin(c, Bin::Or, half, row)
+                } else {
+                    self.s.m.bin(c, Bin::And, lane, not15)
+                };
+                let from = self.s.m.bin(c, Bin::Or, row, selector);
+                let value = self.read_lane(x, from);
+                int(self, value)
+            }
+            "v_cvt_f32_f64" => {
+                let bits = self.src64(inst, 0)?;
+                let f64 = self.s.m.cast(c, Cast::Bitcast, bits, self.s.t.f64);
+                let r = self.s.m.cast(c, Cast::FpTrunc, f64, self.s.t.f32);
+                self.s.flags |= flags::DOUBLE;
+                float(self, r)
+            }
             "v_mad_u64_u32" => {
                 // a * b + c, c and the result 64 bits wide; the carry out
                 // of the sum is this lane's bit of the mask it names.
@@ -10932,6 +11037,16 @@ mod tests {
         used: Vec<UsedResource>,
         wave64: bool,
     ) -> Result<Lowered, crate::ShaderError> {
+        lower_wave_group(words, layout, used, wave64, [1, 1, 1])
+    }
+
+    fn lower_wave_group(
+        words: &[u32],
+        layout: Vec<RootParam>,
+        used: Vec<UsedResource>,
+        wave64: bool,
+        threads: [u32; 3],
+    ) -> Result<Lowered, crate::ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let sgprs: u32 = layout.iter().map(|p| p.sgprs).sum();
         let native = NativeProgram {
@@ -10943,7 +11058,7 @@ mod tests {
             io: StageIo::Cs(ComputeIo {
                 // The layout's user SGPRs (at least two), 512 bytes of LDS.
                 rsrc2: 1 << 15 | sgprs.max(2) << 1,
-                threads: [1, 1, 1],
+                threads,
             }),
             code,
         };
@@ -10982,6 +11097,140 @@ mod tests {
         // host to invalidate its cached view of a buffer.
         assert!(lowers(&[0xE1C4_0000, 0, S_ENDPGM], 0).is_ok(), "buffer_gl0_inv");
         assert!(lowers(&[0xE1C8_0000, 0, S_ENDPGM], 0).is_ok(), "buffer_gl1_inv");
+    }
+
+    #[test]
+    fn a_texture_descriptor_read_only_for_its_dimensions_lowers() {
+        // The 8-dword texture is loaded from a table but never passed to an
+        // image instruction. The shader computes width, height and mip count
+        // from its GFX10 descriptor fields and stores them to a table UAV.
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF40C_0202,
+            0xFA00_0000, // s_load_dwordx8 s[8:15], s[4:5], 0
+            0xF408_0402,
+            0xFA00_0020, // s_load_dwordx4 s[16:19], s[4:5], 0x20 (UAV)
+            0x9014_9E09, // s_lshr_b32 s20, s9, 30
+            0x8F15_820A, // s_lshl_b32 s21, s10, 2
+            0x8814_1514, // s_or_b32 s20, s20, s21
+            0x8714_FF14,
+            0x0000_3FFF, // s_and_b32 s20, s20, 0x3fff
+            0x8114_8114, // s_add_i32 s20, s20, 1
+            0x9396_FF0A,
+            0x000E_000E, // s_bfe_u32 s22, s10, bits 14..27
+            0x8116_8116, // s_add_i32 s22, s22, 1
+            0x9397_FF0B,
+            0x0004_0010, // s_bfe_u32 s23, s11, bits 16..19
+            0x7E02_0214, // v_mov_b32 v1, s20
+            0x7E04_0216, // v_mov_b32 v2, s22
+            0x7E06_0217, // v_mov_b32 v3, s23
+            0xE070_0000,
+            0x8004_0100, // buffer_store_dword v1, off, s[16:19], 0
+            0xE070_0004,
+            0x8004_0200, // buffer_store_dword v2, off, s[16:19], 0 offset:4
+            0xE070_0008,
+            0x8004_0300, // buffer_store_dword v3, off, s[16:19], 0 offset:8
+            S_ENDPGM,
+        ];
+        let used = vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 8,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }];
+        lower_with(words.as_slice(), vec![root(RootType::Table, 0, 0)], used)
+            .expect("dimension-only table texture should use a host GetDimensions query");
+    }
+
+    #[test]
+    fn a_buffer_descriptor_read_only_for_its_record_count_lowers() {
+        // A four-dword table descriptor with no UsedResource entry is
+        // inferred as a raw buffer only because the shader reads dword 2,
+        // the descriptor's size/record-count field.
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0xF408_0402,
+            0xFA00_0010, // s_load_dwordx4 s[16:19], s[4:5], 0x10 (UAV)
+            0x7E02_020A, // v_mov_b32 v1, s10 (record count)
+            0xE070_0000,
+            0x8004_0100, // buffer_store_dword v1, off, s[16:19], 0
+            S_ENDPGM,
+        ];
+        let used = vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 4,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }];
+        lower_with(words.as_slice(), vec![root(RootType::Table, 0, 0)], used)
+            .expect("descriptor record count should use a host GetDimensions query");
+    }
+
+    #[test]
+    fn an_unclassified_table_descriptor_read_is_still_rejected() {
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0xF408_0402,
+            0xFA00_0010, // s_load_dwordx4 s[16:19], s[4:5], 0x10 (UAV)
+            0x7E02_0208, // v_mov_b32 v1, s8 (unknown descriptor address field)
+            0xE070_0000,
+            0x8004_0100, // buffer_store_dword v1, off, s[16:19], 0
+            S_ENDPGM,
+        ];
+        let used = vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 4,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }];
+        let error = match lower_with(words.as_slice(), vec![root(RootType::Table, 0, 0)], used) {
+            Ok(_) => panic!("unknown descriptor address data must not be fabricated"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("descriptor read only as data"));
+    }
+
+    #[test]
+    fn permlane_instructions_lower_for_wave32_and_wave64() {
+        // Initialize the three selector operands, then issue VOP3
+        // v_permlane16_b32 / v_permlanex16_b32 (opcodes 0x377 / 0x378).
+        // The latter is the exact unsupported instruction in the captured
+        // compute shader log; the source lane is confined to this 32-lane
+        // half, so both native wave sizes must translate on 32-lane hosts.
+        let move_zero = |dst: u32| 0x7E00_0000 | dst << 17 | 0x001 << 9 | 0x80;
+        for opcode in [0x377u32, 0x378] {
+            for wave64 in [false, true] {
+                let words = [
+                    move_zero(1),
+                    move_zero(2),
+                    move_zero(3),
+                    0x35 << 26 | opcode << 16,
+                    257 | (258 << 9) | (259 << 18),
+                    S_ENDPGM,
+                ];
+                lower_wave_group(&words, vec![], vec![], wave64, [64, 1, 1])
+                    .unwrap_or_else(|error| panic!("opcode {opcode:#x}, wave64={wave64}: {error}"));
+            }
+        }
     }
 
     #[test]

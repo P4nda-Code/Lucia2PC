@@ -108,6 +108,30 @@ use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
+thread_local! {
+    /// Per-container opt-in for the wave-wide wave64 lowering. Used for
+    /// programs known to fail on a host whose maximum wave size is 32.
+    static WAVE_WIDE_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+struct RestoreWaveWide(bool);
+
+impl Drop for RestoreWaveWide {
+    fn drop(&mut self) {
+        WAVE_WIDE_HERE.set(self.0);
+    }
+}
+
+/// Run one translation with the wave-wide wave64 form enabled. This is
+/// thread-local so concurrent shader translations can select different forms.
+pub fn with_wave_wide<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let previous = WAVE_WIDE_HERE.replace(on);
+    let restore = RestoreWaveWide(previous);
+    let result = f();
+    drop(restore);
+    result
+}
+
 pub use bitcode::census;
 pub use sampler::StaticSampler;
 pub use lower::set_host_max_wave;
@@ -379,7 +403,7 @@ pub fn emit(
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1") || WAVE_WIDE_HERE.get();
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
@@ -785,6 +809,17 @@ mod tests {
     use super::shader::Shader;
     use super::*;
     use crate::native::{ComputeIo, StageIo};
+
+    #[test]
+    fn wave_wide_translation_override_is_scoped_and_nested() {
+        assert!(!WAVE_WIDE_HERE.get());
+        with_wave_wide(true, || {
+            assert!(WAVE_WIDE_HERE.get());
+            with_wave_wide(false, || assert!(!WAVE_WIDE_HERE.get()));
+            assert!(WAVE_WIDE_HERE.get());
+        });
+        assert!(!WAVE_WIDE_HERE.get());
+    }
 
     /// A pixel shader writing SV_StencilRef (channel y of `exp mrtz`).
     /// DXC sets ShaderFlags.StencilRef (bit 11) for a pixel shader whose

@@ -191,6 +191,12 @@ impl Spans {
 /// texture pass last took the ranges ([`remapped`]).
 static REMAPPED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 
+/// More memory ranges arrived than [`REMAPPED`] can keep: the next texture
+/// pass revisits every placed texture slot once instead of leaving textures
+/// in the dropped ranges stale or null for the rest of the run.
+static REMAPPED_OVERFLOWED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// The lowest start and the highest end of any span of [`Spans`] so far
 /// (the start is `u64::MAX` until there is one): what the runtime does to
 /// memory outside is none of the texture pass's business.
@@ -221,8 +227,10 @@ fn stale_out() -> bool {
 /// locks held: this locks one mutex of its own and calls nothing.
 pub(crate) fn remapped(at: usize, len: usize) {
     use std::sync::atomic::Ordering::Relaxed;
-    /// Ranges kept until a pass takes them.
-    const MOST: usize = 1 << 15;
+    /// Ranges kept until a pass takes them. Loading runs of the title have
+    /// exceeded 32K noncontiguous ranges; retain up to 1M before falling back
+    /// to a full placed-slot rescan in the next texture pass.
+    const MOST: usize = 1 << 20;
     let (start, end) = (at as u64, at.saturating_add(len) as u64);
     if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
         return;
@@ -237,9 +245,10 @@ pub(crate) fn remapped(at: usize, len: usize) {
         return;
     }
     if ranges.len() >= MOST {
-        // No pass runs (no shader that picks textures by index is bound):
-        // the slots there are looked at when they are due, as before.
+        // A pass did not take these ranges while loading. Remember that the
+        // next pass must rescan all placed slots after clearing the queue.
         STALE[2].fetch_add(ranges.len() as u64, Relaxed);
+        REMAPPED_OVERFLOWED.store(true, Relaxed);
         ranges.clear();
     }
     ranges.push((start, end));
@@ -833,13 +842,21 @@ impl HostHeap {
     pub(crate) fn texture_slots_remapped(&self, frame: u64) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
         let ranges = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
-        if ranges.is_empty() {
+        let all = REMAPPED_OVERFLOWED.swap(false, Relaxed);
+        if ranges.is_empty() && !all {
             return 0;
         }
         let mut slots: Vec<u32> = {
             let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
-            ranges.iter().flat_map(|&(start, end)| placed.slots_in(start, end)).collect()
+            if all {
+                placed.by_slot.keys().copied().collect()
+            } else {
+                ranges.iter().flat_map(|&(start, end)| placed.slots_in(start, end)).collect()
+            }
         };
+        if all {
+            tracing::info!(slots = slots.len(), "remapped ranges overflowed; rescanning placed texture slots");
+        }
         slots.sort_unstable();
         slots.dedup();
         slots.retain(|&slot| !self.tabled_lately(slot, frame));
@@ -1978,6 +1995,14 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             Some(None)
         }
         View::Placed(unordered, resource, desc) => {
+            if *unordered && resource[0] != 1 {
+                let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                if let Some(texture) = crate::resource::texture_at(address, resource)
+                    && let Some(view) = placed_unordered_texture(view, texture as usize)
+                {
+                    return make(&view, at);
+                }
+            }
             if let Some(view) = placed_texture(view) {
                 return make(&view, at);
             }
@@ -2039,6 +2064,25 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
     let texture = crate::resource::texture_at(address, resource)?;
     Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
+}
+
+/// An unordered view of a texture the title placed in its own memory, as
+/// a view of the host resource made for that memory. The resource and view
+/// descriptions stay separate: the host resource must carry the title's
+/// unordered-access flag, while the descriptor carries the selected mip,
+/// plane and 3D slice range.
+fn placed_unordered_texture(view: &View, texture: usize) -> Option<View> {
+    let View::Placed(true, resource, desc) = view else {
+        return None;
+    };
+    if resource[0] == 1 {
+        return None;
+    }
+    Some(View::Unordered(
+        texture,
+        0,
+        Some(desc[..10].try_into().ok()?),
+    ))
 }
 
 /// A null view of the kind `view` is, for a slot whose view the host
@@ -2259,6 +2303,30 @@ mod tests {
         assert!(!same_placed_texture(&low, &View::Shader(0, None)));
     }
 
+    /// A placed texture UAV keeps its title view fields while resolving to
+    /// the shared host texture; placed buffers continue through buffer UAV
+    /// handling instead.
+    #[test]
+    fn placed_texture_uavs_resolve_to_texture_uavs() {
+        let resource = [3, 0, 0, 0, 512, 0, 512, 0x8_0001, 98, 1, 0, 0x105, 0, 0];
+        let mut desc = [0u32; 16];
+        (desc[0], desc[1], desc[4], desc[5], desc[10], desc[11]) = (98, 8, 2, 4, 0x1000_0000, 0xb);
+        let view = View::Placed(true, resource, desc);
+        let Some(View::Unordered(texture, counter, Some(host_desc))) =
+            placed_unordered_texture(&view, 0x1234)
+        else {
+            panic!("placed texture UAV was not resolved");
+        };
+        assert_eq!(texture, 0x1234);
+        assert_eq!(counter, 0);
+        assert_eq!(host_desc, desc[..10]);
+
+        let mut buffer = resource;
+        buffer[0] = 1;
+        assert!(placed_unordered_texture(&View::Placed(true, buffer, desc), 0x1234).is_none());
+        assert!(placed_unordered_texture(&View::Placed(false, resource, desc), 0x1234).is_none());
+    }
+
     /// A null 3D UAV made on the real device leaves it alive.
     #[test]
     fn null_3d_uav_is_accepted_by_the_device() {
@@ -2390,6 +2458,7 @@ mod tests {
     /// again from the next frame; a stale slot leaves the queue.
     #[test]
     fn remapped_memory_makes_its_texture_slots_due() {
+        let _one = REMAPPED_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let Some(heap) = HostHeap::new(false, 8) else {
             return; // no host GPU
         };
@@ -2416,6 +2485,37 @@ mod tests {
         // A wider texture written at the same address: slot 1 is stale.
         assert_eq!(heap.note_buffer(2, Some(&view(at, 128)), false), [1]);
         assert_eq!(slots(u64::MAX), [2]);
+    }
+
+    /// Tests which take the process-wide remapped ranges run one at a time.
+    static REMAPPED_TESTS: Mutex<()> = Mutex::new(());
+
+    /// Ranges dropped at overflow cause one full placed-slot rescan.
+    #[test]
+    fn overflowed_remapped_ranges_rescan_all_placed_slots_once() {
+        let _one = REMAPPED_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        let at = 0x7fed_0000_0000u64;
+        let mut desc = [0u32; 16];
+        (desc[10], desc[11]) = (at as u32, (at >> 32) as u32);
+        let view = View::Placed(
+            false,
+            [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0],
+            desc,
+        );
+        assert!(heap.note_buffer(3, Some(&view), false).is_empty());
+        let (slot, write) = heap.texture_slots_due(u64::MAX, 8).0[0];
+        assert_eq!(slot, 3);
+        heap.texture_slot_done(slot, write, None);
+
+        REMAPPED.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        REMAPPED_OVERFLOWED.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(heap.texture_slots_remapped(50), 1);
+        assert_eq!(heap.texture_slots_due(51, 8).0.iter().map(|v| v.0).collect::<Vec<_>>(), [3]);
+        assert_eq!(heap.texture_slots_remapped(52), 0);
+        REMAPPED_OVERFLOWED.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// A slot a draw read through a table leaves the queue; the title's

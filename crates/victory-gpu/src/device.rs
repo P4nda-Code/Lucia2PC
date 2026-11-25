@@ -346,19 +346,16 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
     }
 }
 
-/// Device methods 0x1c8 and 0x218 (`SLOT`). The title calls both
-/// (title+0x2477578 and title+0x24800d5) as `(this, description, interface
-/// id, out)`, asks for `ID3D12PipelineState`, and on success keeps the
-/// object `out` names and draws with it; on failure it goes without that
-/// pipeline, silently. What the descriptions hold is not known: the calls
-/// fail as they always did, with `out` null, and the first ones log the
-/// description's words and what its first word points at, so that the two
-/// methods can be written.
-/// shortcut: not implemented. Answering `S_OK` here without making the
-/// pipeline would hand the title whatever its stack held as an object.
-extern "system" fn unknown_pipeline<const SLOT: usize>(
+/// Device slots 57 and 67 (byte offsets 0x1c8 and 0x218): the console's
+/// graphics/compute `DeserializePipelineStateX` methods. The call sites in
+/// this title have the `(this, state, interface id, out)` shape. The state
+/// is a console-driver pipeline cache blob, not a normal PSO description;
+/// it is not a host D3D12 cached PSO. Keep the cache miss explicit until
+/// that format can be decoded; claiming success without an object would
+/// hand the title an invalid pipeline pointer.
+extern "system" fn deserialize_pipeline_x<const SLOT: usize>(
     _: This,
-    desc: *const u8,
+    state: *const u8,
     _iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
@@ -384,16 +381,16 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
         };
         #[cfg(not(windows))]
         let words = |_: usize| None::<Vec<u64>>;
-        let description = words(desc as usize);
-        let first = description
+        let cache_state = words(state as usize);
+        let first = cache_state
             .as_ref()
             .and_then(|w| words(w[0] as usize));
         tracing::warn!(
             slot = format_args!("{:#x}", SLOT),
             calls,
-            description = format_args!("{description:x?}"),
+            state = format_args!("{cache_state:x?}"),
             first_points_at = format_args!("{first:x?}"),
-            "a pipeline creation method that is not implemented: the title goes without this pipeline"
+            "console pipeline cache deserialization is unsupported"
         );
     }
     E_NOTIMPL
@@ -435,10 +432,10 @@ static FUNCTIONS: Table<160> = {
     f[39] = query::create as *const (); // 0x138
     f[41] = signature::create as *const (); // 0x148
     f[48] = queue::create_x as *const (); // 0x180
-    f[57] = unknown_pipeline::<0x1c8> as *const (); // 0x1c8
+    f[57] = deserialize_pipeline_x::<0x1c8> as *const (); // 0x1c8
     f[61] = descriptor::create_sampler_x as *const (); // 0x1e8
     f[62] = pipeline::create_compute_x as *const (); // 0x1f0
-    f[67] = unknown_pipeline::<0x218> as *const (); // 0x218
+    f[67] = deserialize_pipeline_x::<0x218> as *const (); // 0x218
     f[69] = object::ignore as *const (); // 0x228 debug error filter
     f[70] = descriptor::create_placed_srv as *const (); // 0x230
     f[71] = descriptor::create_placed_uav as *const (); // 0x238
@@ -486,6 +483,22 @@ mod tests {
         );
         let missing = slot::<extern "system" fn() -> HRESULT>(device, 0xf0);
         assert_eq!(missing(), E_NOTIMPL);
+    }
+
+    #[test]
+    fn console_pipeline_cache_loads_fail_without_returning_a_pipeline() {
+        for deserialize in [
+            deserialize_pipeline_x::<0x1c8>
+                as extern "system" fn(This, *const u8, *const Iid, *mut This) -> HRESULT,
+            deserialize_pipeline_x::<0x218>,
+        ] {
+            let mut out = device();
+            assert_eq!(
+                deserialize(device(), std::ptr::null(), &IID, &mut out),
+                E_NOTIMPL
+            );
+            assert!(out.is_null());
+        }
     }
 
     #[test]
