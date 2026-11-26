@@ -362,45 +362,6 @@ impl Memory {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn fault_bitmap_preserves_colliding_pages_without_mutating_gpu_state() {
-        // Pages 7 and 7 + 4095 collided in the old modulo fault list.
-        let mut words = vec![0; MEMORY_FAULTS as usize];
-        for page in [7, 7 + 4095, 31, 32, MEMORY_PAGES - 1] {
-            let word = (page / 32) as usize;
-            words[word] |= 1 << (page % 32);
-        }
-        let got = fault_pages(&words);
-        let mut got = got;
-        got.sort_unstable();
-        assert_eq!(got, [7, 31, 32, 4102, MEMORY_PAGES - 1]);
-        assert!(fault_pages(&words).contains(&(MEMORY_PAGES - 1)));
-    }
-
-    #[test]
-    fn fault_bitmap_allocation_covers_exactly_the_address_directory() {
-        assert_eq!(MEMORY_FAULTS, MEMORY_PAGES.div_ceil(32));
-    }
-
-    #[test]
-    fn page_bounds_include_both_sides_of_crossed_boundaries() {
-        assert_eq!(page_bounds(PAGE - 4, 8), Some((0, 1)));
-        assert_eq!(page_bounds(PAGE, PAGE), Some((1, 1)));
-        assert_eq!(page_bounds(u64::MAX - 3, 8), None);
-        assert_eq!(page_bounds(0, 0), None);
-    }
-
-    #[test]
-    fn retirement_clears_only_entries_owned_by_the_released_copy() {
-        assert_eq!(retired_entry([4, 0x1234], 4), Some([0, 0]));
-        assert_eq!(retired_entry([5, 0x5678], 4), None);
-    }
-}
-
 /// Before a draw whose shader reads title memory by address: what its
 /// root arguments name gets its copies (`addresses`: its root views;
 /// `constants`: its root constants, see the module), every numbered copy
@@ -554,3 +515,44 @@ pub(crate) fn invalidate(address: u64, len: u64) {
         }
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fault_bitmap_preserves_colliding_pages_without_mutating_gpu_state() {
+        // Pages 7 and 7 + 4095 collided in the old modulo fault list.
+        let mut words = vec![0; MEMORY_FAULTS as usize];
+        for page in [7, 7 + 4095, 31, 32, MEMORY_PAGES - 1] {
+            let word = (page / 32) as usize;
+            words[word] |= 1 << (page % 32);
+        }
+        let got = fault_pages(&words);
+        let mut got = got;
+        got.sort_unstable();
+        assert_eq!(got, [7, 31, 32, 4102, MEMORY_PAGES - 1]);
+        assert!(fault_pages(&words).contains(&(MEMORY_PAGES - 1)));
+    }
+
+    #[test]
+    fn fault_bitmap_allocation_covers_exactly_the_address_directory() {
+        assert_eq!(MEMORY_FAULTS, MEMORY_PAGES.div_ceil(32));
+    }
+
+    #[test]
+    fn page_bounds_include_both_sides_of_crossed_boundaries() {
+        assert_eq!(page_bounds(PAGE - 4, 8), Some((0, 1)));
+        assert_eq!(page_bounds(PAGE, PAGE), Some((1, 1)));
+        assert_eq!(page_bounds(u64::MAX - 3, 8), None);
+        assert_eq!(page_bounds(0, 0), None);
+    }
+
+    #[test]
+    fn retirement_clears_only_entries_owned_by_the_released_copy() {
+        assert_eq!(retired_entry([4, 0x1234], 4), Some([0, 0]));
+        assert_eq!(retired_entry([5, 0x5678], 4), None);
+    }
+}
+
