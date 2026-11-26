@@ -634,7 +634,7 @@ fn mirror_unlocked() -> bool {
 /// title's heap turns out to have; a heap that fits is not capped and
 /// keeps no null slot there (an index past it is as undefined as before).
 pub(crate) fn probe_view_limit() {
-    const TITLE_HEAP_AND_RESERVE: u32 = 1_507_329;
+    const TITLE_HEAP_AND_RESERVE: u32 = 1_507_328;
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let Some(host) = host() else { return };
