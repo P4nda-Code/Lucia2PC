@@ -262,11 +262,14 @@ impl State {
         let version = snapshot.version();
         let dwords = victory_shader::emit::SLOT_REMAP_COUNT;
         if snapshot.logical_count() > dwords {
-            once!(
-                logical = snapshot.logical_count(),
-                capacity = dwords,
-                "direct-index residency map exceeds the shader table"
-            );
+            static WARN_REMAP_CAPACITY: std::sync::Once = std::sync::Once::new();
+            WARN_REMAP_CAPACITY.call_once(|| {
+                tracing::warn!(
+                    logical = snapshot.logical_count(),
+                    capacity = dwords,
+                    "direct-index residency map exceeds the shader table"
+                );
+            });
             return None;
         }
         let bytes = u64::from(dwords) * 4;
@@ -1097,8 +1100,7 @@ impl State {
                             .translated()
                             .host
                             .root_srvs
-                            .iter()
-                            .any(|(slot, _)| *slot == victory_shader::emit::SLOT_REMAP)
+                            .contains(&victory_shader::emit::SLOT_REMAP)
                     });
                 if !remapped {
                     once!(
