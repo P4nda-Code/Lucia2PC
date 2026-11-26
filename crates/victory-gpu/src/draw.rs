@@ -1144,7 +1144,14 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
-            let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
+            let direct_heap = p.stages.iter().any(|stage| stage.translated().uses_resource_heap);
+            let made = self.tables(
+                list,
+                &t.used,
+                &t.host.root_indexed_views,
+                compute,
+                direct_heap,
+            );
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
@@ -2138,6 +2145,7 @@ impl State {
         used: &[UsedResource],
         indexed: &[RootIndexedView],
         compute: bool,
+        direct_heap: bool,
     ) -> Vec<(u8, u32)> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         let mut fresh: Vec<u8> = used
@@ -2215,6 +2223,7 @@ impl State {
             }
         }
         let mut made = Vec::new();
+        let mut resident_heap = None;
         for slot in fresh {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
@@ -2313,7 +2322,8 @@ impl State {
             for k in 0..n {
                 let index = first + k;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
-                match crate::descriptor::view(table + u64::from(k) * 32) {
+                let title_handle = table + u64::from(k) * 32;
+                match crate::descriptor::view(title_handle) {
                     Some(View::Constant(address, size)) => {
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                             host.make_null(index);
@@ -2351,8 +2361,28 @@ impl State {
                         }
                     }
                 }
+                // A direct ResourceHeap access uses the title's absolute
+                // logical descriptor index, not this table's relocated
+                // offset. Publish descriptors that this draw can name from
+                // the table so the shader's remap lookup reaches a real view.
+                if direct_heap
+                    && (used.is_some() || selected.binary_search(&k).is_ok())
+                    && let Some(logical) = heap.index(title_handle)
+                    && logical >= host.count()
+                {
+                    let heap_id = std::ptr::from_ref(heap) as usize;
+                    if crate::descriptor::make_resident(heap_id, logical, title_handle).is_ok() {
+                        resident_heap = Some(heap_id);
+                    }
+                }
             }
             made.push((slot, first * 32));
+        }
+        if let Some(heap) = resident_heap {
+            self.residency_gpu = None;
+            if let Some(snapshot) = crate::descriptor::residency_snapshot(heap) {
+                self.residency.push(snapshot);
+            }
         }
         made
     }
