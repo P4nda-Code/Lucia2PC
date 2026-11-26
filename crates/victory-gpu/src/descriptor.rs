@@ -181,28 +181,6 @@ fn invalidate_residency(handle: u64) {
     }
 }
 
-/// Installs the current logical descriptor in the shared physical pool and
-/// publishes its mapping only after the D3D12 copy succeeds.
-#[cfg(windows)]
-pub(crate) fn make_resident(
-    heap: usize,
-    logical: u32,
-    handle: u64,
-) -> Result<u32, residency::ResidencyError> {
-    if heap == 0 {
-        return Err(residency::ResidencyError::InvalidLogicalIndex);
-    }
-    // SAFETY: only registered title heaps are passed by draw state.
-    let title = unsafe { &*(heap as *const Heap) };
-    if logical >= title.desc.count || title.samplers() || title.index(handle) != Some(logical) {
-        return Err(residency::ResidencyError::InvalidLogicalIndex);
-    }
-    title
-        .host()
-        .ok_or(residency::ResidencyError::DescriptorCopyFailed)?
-        .make_resident(logical, handle)
-}
-
 /// Current generation of a title heap's logical-to-physical mapping.
 #[cfg(windows)]
 pub(crate) fn residency_version(heap: usize) -> Option<u64> {
