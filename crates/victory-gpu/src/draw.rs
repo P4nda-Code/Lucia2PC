@@ -1141,6 +1141,12 @@ impl State {
             list.keep(&p.pso);
             list.keep(&p.root);
         }
+        if p.stages.iter().any(|stage| stage.translated().uses_resource_heap)
+            && self.heap_buffers(list).is_none()
+        {
+            once!("a direct ResourceHeap shader has no host view-heap mapping resources; the draw is dropped");
+            return false;
+        }
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
@@ -1602,7 +1608,12 @@ impl State {
             let Some(handle) = heap.handle(index) else {
                 continue;
             };
-            let Some(view) = host.mirror(index, handle, true) else {
+            let view = if index < host.count() {
+                host.mirror(index, handle, true)
+            } else {
+                crate::descriptor::view(handle)
+            };
+            let Some(view) = view else {
                 continue;
             };
             // Every 64 views while the device lives (a cheap query).
@@ -1625,6 +1636,11 @@ impl State {
             let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
                 continue;
             };
+            if index >= host.count()
+                && let Err(error) = host.make_resident(index, handle)
+            {
+                once!(index, ?error, "an overflow buffer descriptor could not be made resident");
+            }
             #[cfg(feature = "diagnostics")]
             if host.shows(index, &shadow.buffer) == Some(false) {
                 HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
