@@ -1088,13 +1088,21 @@ impl State {
                     .filter(|stage| stage.translated().uses_resource_heap)
                     .map(|stage| (stage.shader.stage, stage.shader.hash.as_str()))
                     .collect::<Vec<_>>();
+                if victory_shader::emit::view_heap_limit() == 0 {
+                    once!(
+                        logical = title_heap.count(),
+                        physical = host_heap.count(),
+                        ?shaders,
+                        "direct ResourceHeap access has no shader-side remapping; the draw is dropped to prevent an out-of-bounds heap read"
+                    );
+                    return false;
+                }
                 once!(
                     logical = title_heap.count(),
                     physical = host_heap.count(),
                     ?shaders,
-                    "a draw or dispatch uses direct ResourceHeap indexing beyond the physical host prefix and was dropped"
+                    "direct ResourceHeap access uses residency remapping; descriptors not yet resident resolve to null"
                 );
-                return false;
             }
         }
         // Heaps first: a root signature with directly indexed heaps must be
