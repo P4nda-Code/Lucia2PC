@@ -145,6 +145,7 @@ struct State {
     logical: Vec<Option<u32>>,
     physical: HashMap<u32, Resident>,
     identity: HashMap<u128, u32>,
+    version: u64,
 }
 
 struct Inner {
@@ -169,6 +170,7 @@ impl Residency {
                     logical: vec![None; logical_count as usize],
                     physical: HashMap::new(),
                     identity: HashMap::new(),
+                    version: 0,
                 }),
             }),
         }
@@ -238,6 +240,7 @@ impl Residency {
         );
         state.logical[logical as usize] = Some(physical);
         state.identity.insert(identity, physical);
+        state.version = state.version.wrapping_add(1);
         Ok(physical)
     }
 
@@ -254,6 +257,7 @@ impl Residency {
         let Some(physical) = state.logical[logical as usize].take() else {
             return Ok(());
         };
+        state.version = state.version.wrapping_add(1);
         let resident = state.physical.get_mut(&physical).expect("logical mapping exists");
         resident.current = false;
         let identity = resident.identity;
@@ -264,6 +268,10 @@ impl Residency {
             self.inner.slots.release(physical, 1);
         }
         Ok(())
+    }
+
+    pub(crate) fn version(&self) -> u64 {
+        self.inner.state.lock().unwrap_or_else(|e| e.into_inner()).version
     }
 
     pub(crate) fn snapshot(&self) -> MappingSnapshot {
@@ -289,6 +297,7 @@ impl Residency {
             lease: Arc::new(SnapshotLease {
                 map: map.into_boxed_slice(),
                 slots,
+                version: state.version,
                 inner: Arc::clone(&self.inner),
             }),
             keepalive: None,
@@ -299,6 +308,7 @@ impl Residency {
 struct SnapshotLease {
     map: Box<[u32]>,
     slots: Vec<u32>,
+    version: u64,
     inner: Arc<Inner>,
 }
 
@@ -319,6 +329,10 @@ impl MappingSnapshot {
 
     pub(crate) fn logical_count(&self) -> u32 {
         self.lease.map.len() as u32
+    }
+
+    pub(crate) fn version(&self) -> u64 {
+        self.lease.version
     }
 
     pub(crate) fn encoded(&self) -> &[u32] {
