@@ -1017,14 +1017,16 @@ impl HostHeap {
         logical: u32,
         handle: u64,
         source_index: u32,
+        expected_view: &View,
     ) -> Result<u32, super::residency::ResidencyError> {
         if source_index < self.count || source_index >= self.count + self.dynamic {
             return Err(super::residency::ResidencyError::InvalidLogicalIndex);
         }
         // SAFETY: the title supplied a live descriptor handle in its heap.
-        let [tag, view_index, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
-        if tag != VIEW_TAG || view_at(view_index, generation).is_none() {
-            return Err(super::residency::ResidencyError::DescriptorCopyFailed);
+        let record_words = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        let [tag, view_index, generation] = record_words;
+        if tag != VIEW_TAG || view_at(view_index, generation).as_ref() != Some(expected_view) {
+            return Err(super::residency::ResidencyError::DescriptorChanged);
         }
         let record = u64::from(generation) << 32 | u64::from(view_index);
         let identity = (u128::from(logical) << 64) | u128::from(record);
@@ -1034,7 +1036,30 @@ impl HostHeap {
             .unwrap_or_else(|e| e.into_inner())
             .get(source_index as usize)
             .and_then(Clone::clone);
-        let result = self.publish_cpu_descriptor(logical, identity, self.cpu(source_index), resource);
+        let residency = self
+            .residency
+            .as_ref()
+            .ok_or(super::residency::ResidencyError::DescriptorCopyFailed)?;
+        let result = residency.map_with(logical, identity, |physical| {
+            let current = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+            if current != record_words
+                || view_at(view_index, generation).as_ref() != Some(expected_view)
+            {
+                return Err(super::residency::ResidencyError::DescriptorChanged);
+            }
+            self.copy_descriptor_to_physical(
+                physical,
+                self.cpu(source_index),
+                resource.clone(),
+            )?;
+            let current = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+            if current != record_words
+                || view_at(view_index, generation).as_ref() != Some(expected_view)
+            {
+                return Err(super::residency::ResidencyError::DescriptorChanged);
+            }
+            Ok(())
+        });
         if result.is_ok() {
             self.complete_residency(logical);
         }
