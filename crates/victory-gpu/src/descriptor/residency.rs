@@ -271,11 +271,16 @@ impl Residency {
         let mut map = Vec::with_capacity(state.logical.len());
         let mut slots = Vec::new();
         let logical = state.logical.clone();
-        for physical in &logical {
+        for (index, physical) in logical.iter().enumerate() {
             if let Some(physical) = physical {
                 state.physical.get_mut(physical).expect("logical mapping exists").snapshots += 1;
                 map.push(*physical);
                 slots.push(*physical);
+            } else if (index as u32) < self.inner.slots.first {
+                // The host heap's title prefix is mirrored in place. It does
+                // not consume a dynamic slot and therefore is not in the
+                // residency lease's release list.
+                map.push(index as u32);
             } else {
                 map.push(UNMAPPED_DESCRIPTOR);
             }
@@ -418,8 +423,12 @@ mod tests {
         assert_eq!(snapshot.logical_count(), LOGICAL);
         assert_eq!(snapshot.lookup(PREFIX), Mapping::Resident(64));
         assert_eq!(snapshot.lookup(high), Mapping::Resident(65));
-        assert_eq!(snapshot.lookup(0), Mapping::Unresident);
-        assert_eq!(snapshot.encoded()[0], UNMAPPED_DESCRIPTOR);
+        // The mirrored physical prefix is an identity mapping even
+        // though it is not allocated by the dynamic residency pool.
+        assert_eq!(snapshot.lookup(0), Mapping::Resident(0));
+        assert_eq!(snapshot.encoded()[0], 0);
+        assert_eq!(snapshot.lookup(PREFIX + 1), Mapping::Unresident);
+        assert_eq!(snapshot.encoded()[(PREFIX + 1) as usize], UNMAPPED_DESCRIPTOR);
         assert_eq!(snapshot.lookup(LOGICAL), Mapping::Invalid);
     }
 
