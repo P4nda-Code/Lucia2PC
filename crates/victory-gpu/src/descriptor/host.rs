@@ -1066,6 +1066,25 @@ impl HostHeap {
         result
     }
 
+    #[cfg(test)]
+    /// Publishes a descriptor already made in a CPU heap for the D3D12
+    /// residency integration test.
+    fn publish_cpu_descriptor(
+        &self,
+        logical: u32,
+        identity: u128,
+        source: D3D12_CPU_DESCRIPTOR_HANDLE,
+        resource: Option<ID3D12Resource>,
+    ) -> Result<u32, super::residency::ResidencyError> {
+        let residency = self
+            .residency
+            .as_ref()
+            .ok_or(super::residency::ResidencyError::DescriptorCopyFailed)?;
+        residency.map_with(logical, identity, |physical| {
+            self.copy_descriptor_to_physical(physical, source, resource.clone())
+        })
+    }
+
     fn copy_descriptor_to_physical(
         &self,
         physical: u32,
