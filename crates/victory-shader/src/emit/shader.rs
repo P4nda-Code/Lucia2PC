@@ -448,12 +448,8 @@ impl Shader {
             );
             let value = self.m.extract(block, loaded, 0);
             let physical = self.m.cast(block, Cast::Bitcast, value, self.t.i32);
-            let missing = self.m.cmp(
-                block,
-                pred::EQ,
-                physical,
-                self.m.i32(u32::MAX),
-            );
+            let unmapped = self.m.i32(u32::MAX);
+            let missing = self.m.cmp(block, pred::EQ, physical, unmapped);
             let null = self.m.i32(limit);
             self.m.select(block, missing, null, physical)
         } else if sampler {
