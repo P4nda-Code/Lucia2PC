@@ -214,7 +214,7 @@ pub(crate) struct State {
     residency: Vec<crate::descriptor::residency::MappingSnapshot>,
     /// GPU address of this list's immutable direct-index map upload, keyed
     /// by the title view heap. The upload is retained by HostList scratch.
-    residency_gpu: Option<(usize, u64)>,
+    residency_gpu: Option<(usize, u64, u64)>,
 }
 
 impl Drop for State {
@@ -251,12 +251,15 @@ impl State {
         if heap == 0 {
             return None;
         }
-        if let Some((cached_heap, gpu)) = self.residency_gpu
+        let version = crate::descriptor::residency_version(heap)?;
+        if let Some((cached_heap, cached_version, gpu)) = self.residency_gpu
             && cached_heap == heap
+            && cached_version == version
         {
             return Some(gpu);
         }
         let snapshot = crate::descriptor::residency_snapshot(heap)?;
+        let version = snapshot.version();
         let dwords = victory_shader::emit::SLOT_REMAP_COUNT;
         if snapshot.logical_count() > dwords {
             once!(
@@ -276,7 +279,7 @@ impl State {
         table.fill(crate::descriptor::residency::UNMAPPED_DESCRIPTOR);
         snapshot.copy_encoded_to(table).ok()?;
         self.residency.push(snapshot);
-        self.residency_gpu = Some((heap, gpu));
+        self.residency_gpu = Some((heap, version, gpu));
         Some(gpu)
     }
 
