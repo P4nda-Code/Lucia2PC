@@ -7,6 +7,14 @@ use std::sync::{Arc, Mutex};
 
 pub(crate) const UNMAPPED_DESCRIPTOR: u32 = u32::MAX;
 
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Mapping {
+    Resident(u32),
+    Unresident,
+    Invalid,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ResidencyError {
     InvalidLogicalIndex,
@@ -111,6 +119,11 @@ impl PhysicalSlots {
         slots.fill(false);
         state.free += newly_free;
         state.too_long = u32::MAX;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn free_count(&self) -> u32 {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).free
     }
 
     pub(crate) fn note_fragmented(&self, count: u32) {
@@ -322,6 +335,20 @@ impl MappingSnapshot {
 
     pub(crate) fn version(&self) -> u64 {
         self.lease.version
+    }
+
+    #[cfg(test)]
+    pub(crate) fn encoded(&self) -> &[u32] {
+        &self.lease.map
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lookup(&self, logical: u32) -> Mapping {
+        match self.lease.map.get(logical as usize) {
+            Some(&UNMAPPED_DESCRIPTOR) => Mapping::Unresident,
+            Some(&physical) => Mapping::Resident(physical),
+            None => Mapping::Invalid,
+        }
     }
 
     /// Copies the complete logical-to-physical table into a GPU upload
