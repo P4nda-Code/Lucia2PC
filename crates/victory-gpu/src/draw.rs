@@ -1851,7 +1851,14 @@ impl State {
                 }
                 continue;
             }
-            let view = heap.handle(index).and_then(|handle| host.mirror(index, handle, true));
+            let handle = heap.handle(index);
+            let view = handle.and_then(|handle| {
+                if index < host.count() {
+                    host.mirror(index, handle, true)
+                } else {
+                    crate::descriptor::view(handle)
+                }
+            });
             let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
             let resource = match placed.as_ref().or(view.as_ref()) {
                 Some(&View::Shader(resource, _)) => resource as This,
@@ -1861,6 +1868,12 @@ impl State {
                 }
             };
             let title_fills = crate::resource::host_resource(resource).is_some_and(crate::texture::title_written);
+            if index >= host.count()
+                && let Some(handle) = handle
+                && let Err(error) = host.make_resident(index, handle)
+            {
+                once!(index, ?error, "an overflow texture descriptor could not be made resident");
+            }
             if !title_fills {
                 // a render target, a depth or unordered access texture: the host's own
                 host.texture_slot_done(index, write, None);
