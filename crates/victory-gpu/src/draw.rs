@@ -269,6 +269,15 @@ impl State {
         Some(gpu)
     }
 
+    #[cfg(test)]
+    /// Retains a mapping for the command-list lifetime test.
+    pub(crate) fn retain_residency(
+        &mut self,
+        snapshot: crate::descriptor::residency::MappingSnapshot,
+    ) {
+        self.residency.push(snapshot);
+    }
+
     /// The list's submission has run (submissions are waited for): the
     /// dynamic slots its tables were made in are given back, not kept
     /// until the title resets the list. A frame of the opening cutscene
