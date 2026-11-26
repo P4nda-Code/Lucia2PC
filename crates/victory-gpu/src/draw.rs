@@ -2361,11 +2361,15 @@ impl State {
                         let title_handle = table + u64::from(k) * 32;
                         if let Some(logical) = heap.index(title_handle)
                             && logical >= host.count()
-                            && host.make_resident_from_host_slot(
-                                logical,
-                                title_handle,
-                                first + k,
-                            ).is_ok()
+                            && let Some(view) = crate::descriptor::view(title_handle)
+                            && host
+                                .make_resident_from_host_slot(
+                                    logical,
+                                    title_handle,
+                                    first + k,
+                                    &view,
+                                )
+                                .is_ok()
                         {
                             resident_heap = Some(heap_id);
                         }
@@ -2392,8 +2396,11 @@ impl State {
                 let index = first + k;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 let title_handle = table + u64::from(k) * 32;
+                let mut source_view = None;
                 match crate::descriptor::view(title_handle) {
                     Some(View::Constant(address, size)) => {
+                        let view = View::Constant(address, size);
+                        source_view = Some(view);
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                             host.make_null(index);
                             continue;
@@ -2402,6 +2409,7 @@ impl State {
                         host.constant_at(index, gpu, size);
                     }
                     Some(view) => {
+                        source_view = Some(view.clone());
                         host.make_at(index, &view);
                         let kind = used.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
@@ -2438,10 +2446,11 @@ impl State {
                     && (used.is_some() || selected.binary_search(&k).is_ok())
                     && let Some(logical) = heap.index(title_handle)
                     && logical >= host.count()
+                    && let Some(view) = source_view.as_ref()
                 {
                     let heap_id = std::ptr::from_ref(heap) as usize;
                     if host
-                        .make_resident_from_host_slot(logical, title_handle, index)
+                        .make_resident_from_host_slot(logical, title_handle, index, view)
                         .is_ok()
                     {
                         resident_heap = Some(heap_id);
