@@ -481,7 +481,7 @@ mod tests {
 
     #[test]
     fn gpu_table_copy_preserves_resident_and_unmapped_entries() {
-        let r = Residency::new(8, Arc::new(PhysicalSlots::new(128, 2).unwrap()));
+        let r = Residency::new(8, Arc::new(PhysicalSlots::new(0, 2).unwrap()));
         let first = r.map(2, 20).unwrap();
         let second = r.map(7, 70).unwrap();
         let snapshot = r.snapshot();
@@ -521,8 +521,8 @@ mod tests {
     fn invalid_indices_and_duplicate_identities_fail_closed() {
         let r = manager(2);
         assert_eq!(r.map(LOGICAL, 1), Err(ResidencyError::InvalidLogicalIndex));
-        r.map(1, 44).unwrap();
-        assert_eq!(r.map(2, 44), Err(ResidencyError::DuplicateIdentity));
-        assert_eq!(r.snapshot().lookup(2), Mapping::Unresident);
+        r.map(PREFIX, 44).unwrap();
+        assert_eq!(r.map(PREFIX + 1, 44), Err(ResidencyError::DuplicateIdentity));
+        assert_eq!(r.snapshot().lookup(PREFIX + 1), Mapping::Unresident);
     }
 }
