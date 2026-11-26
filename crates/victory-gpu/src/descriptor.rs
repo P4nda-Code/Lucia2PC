@@ -98,7 +98,13 @@ impl Heap {
                 let step = u64::from(increment(self.desc.kind)?);
                 let h = host::HostHeap::new(self.samplers(), self.desc.count)?;
                 for i in pending.drain(..) {
-                    h.mirror(i, self.start + u64::from(i) * step, false);
+                    let handle = self.start + u64::from(i) * step;
+                    if i < h.count() {
+                        h.mirror(i, handle, false);
+                    } else {
+                        h.note_overflow(i, handle);
+                        let _ = h.make_resident(i, handle);
+                    }
                 }
                 Some(h)
             })
@@ -155,7 +161,12 @@ fn mirror(handle: u64) {
         Some(host) => {
             drop(pending);
             if let Some(host) = host {
-                host.mirror(index, handle, false);
+                if index < host.count() {
+                    host.mirror(index, handle, false);
+                } else {
+                    host.note_overflow(index, handle);
+                    let _ = host.make_resident(index, handle);
+                }
             }
         }
     }
