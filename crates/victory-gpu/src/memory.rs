@@ -147,7 +147,12 @@ impl Memory {
         let whole = |s: &Arc<Shadow>| s.offset_in(start).is_some_and(|_| s.left(start) >= PAGE);
         let Some(shadow) = crate::shadow::find(start, 1)
             .filter(whole)
-            .or_else(|| crate::shadow::find(start, PAGE).filter(whole))
+            // Raw pointers can target title allocations without a D3D12
+            // resource object. find() only searches resource-backed buffers;
+            // find_any() also creates/reuses the loose-memory window used by
+            // ordinary raw-address reads. Without this fallback, a committed
+            // pointer-reachable page outside a buffer can never acquire a copy.
+            .or_else(|| crate::shadow::find_any(start, PAGE).filter(whole))
         else {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(address = format_args!("{start:#x}"), "title memory by address: committed page has no host shadow copy"));
