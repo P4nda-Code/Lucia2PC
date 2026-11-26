@@ -120,6 +120,8 @@ impl Memory {
         let page = address / PAGE;
         // The last entry stays empty: addresses past the directory read it.
         if page >= u64::from(MEMORY_PAGES) - 1 {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::warn!(address = format_args!("{address:#x}"), "title memory by address: pointer is outside the 128 GiB directory"));
             return;
         }
         // SAFETY: inside the directory's mapping.
@@ -136,6 +138,8 @@ impl Memory {
         }
         if !crate::texture::committed(start as *const u8, PAGE as usize) {
             self.refused.insert(page);
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::warn!(address = format_args!("{start:#x}"), "title memory by address: faulted page is not committed title memory"));
             return;
         }
         // The copy a root view at that address would get; a buffer that
@@ -145,11 +149,15 @@ impl Memory {
             .filter(whole)
             .or_else(|| crate::shadow::find(start, PAGE).filter(whole))
         else {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::warn!(address = format_args!("{start:#x}"), "title memory by address: committed page has no host shadow copy"));
             return;
         };
         // SAFETY: a live buffer.
         let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
         if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::warn!(address = format_args!("{start:#x}"), "title memory by address: host shadow copy cannot be exposed as a raw UAV"));
             return;
         }
         let n = match self.copies.iter().position(|c| Arc::ptr_eq(c, &shadow)) {
@@ -180,7 +188,7 @@ impl Memory {
             None => {
                 static ONCE: std::sync::Once = std::sync::Once::new();
                 ONCE.call_once(|| {
-                    tracing::warn!(COPIES, "title memory by address: no number left for another copy; its pages read zeros")
+                    tracing::warn!(COPIES, address = format_args!("{start:#x}"), "title memory by address: no number left for another copy; its pages read zeros")
                 });
                 return;
             }
