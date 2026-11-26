@@ -12,4 +12,4 @@ New-Item -ItemType Directory -Force $Cache, $Data | Out-Null
 $env:VICTORY_CACHE_DIR = $Cache
 $env:VICTORY_DATA_DIR = $Data
 & $Exe run $Game --execute 2>&1 | Out-File "$env:TEMP\Lucia2PC.log" -Encoding utf8
-Write-Host "Exited with $LASTEXITCODE; log: $env:TEMP\ztrx.log"
+Write-Host "Exited with $LASTEXITCODE; log: $env:TEMP\Lucia2PC.log"
