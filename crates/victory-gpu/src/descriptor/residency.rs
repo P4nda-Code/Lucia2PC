@@ -461,6 +461,24 @@ mod tests {
     }
 
     #[test]
+    fn mapping_versions_change_only_when_the_logical_map_changes() {
+        let r = manager(2);
+        assert_eq!(r.version(), 0);
+
+        let physical = r.map(PREFIX, 100).unwrap();
+        let first = r.snapshot();
+        assert_eq!(first.version(), 1);
+        assert_eq!(r.version(), 1);
+
+        assert_eq!(r.map(PREFIX, 100).unwrap(), physical);
+        assert_eq!(r.version(), 1, "an unchanged descriptor does not invalidate uploads");
+
+        r.invalidate(PREFIX).unwrap();
+        assert_eq!(r.version(), 2);
+        assert_eq!(first.version(), 1, "submitted snapshots remain immutable");
+    }
+
+    #[test]
     fn gpu_table_copy_preserves_resident_and_unmapped_entries() {
         let r = Residency::new(8, Arc::new(PhysicalSlots::new(128, 2).unwrap()));
         let first = r.map(2, 20).unwrap();
