@@ -14,6 +14,8 @@ Lucia2PC is an active experimental project. The current development work is conc
 
 This is a hardware/API probe, not proof that the full game renderer works on the GPU. This README intentionally makes no claim about a verified playable frame rate or a completed end-to-end gameplay session.
 
+**Latest local verification (2026-11-26):** on the current pulled `main` revision, the user reported `cargo test --workspace --locked` passing (546 passed, 7 ignored), `cargo clippy --workspace --all-targets --locked -- -D warnings` passing with no warnings, and `cargo build --release --workspace --locked` completing successfully. These checks verify Rust compilation, linting, and unit tests; they do not establish that the game launches or renders correctly.
+
 ### Descriptor work implemented
 
 The latest published implementation adds groundwork for handling a title descriptor heap that is larger than the host's accepted shader-visible heap:
@@ -23,9 +25,13 @@ The latest published implementation adds groundwork for handling a title descrip
 - A mapping is published only after the descriptor copy succeeds.
 - Descriptor updates and copies invalidate affected resident mappings.
 - Mapping snapshots retain the referenced resources and physical slots across recorded GPU work.
+- Direct SM 6.6 `ResourceDescriptorHeap` accesses on a capped host are translated through a GPU-visible logical-to-physical remapping table.
+- The remapping table is uploaded per command list, refreshed when the residency generation changes, and backed by snapshots that pin referenced physical slots through submission.
+- The shader clamps logical indices to the table bounds, resolves resident entries to physical descriptors, and sends unmapped entries to a dedicated null slot.
+- Draw preparation attempts to populate residency for high descriptors discovered through heap-wide buffer/texture preparation and descriptors selected from relocated root tables.
 - Root descriptor-table relocation remains a separate mechanism from direct global-heap indexing.
 
-**Important remaining limitation:** the production shader path does not yet consume the residency snapshots to translate direct SM 6.6 `ResourceDescriptorHeap` indices. The runtime still rejects affected draws or dispatches when a shader uses direct resource-heap indexing beyond the physical host prefix. That guard is intentional and must remain until GPU-visible mapping data, shader-side index translation, and GPU readback have been implemented and verified.
+**Important remaining limitation:** this is an implemented code path, not yet a verified end-to-end rendering result. The current unit tests and Windows release build do not prove that every descriptor type, shader access pattern, resource lifetime, or GPU synchronization case works in the retail game. Unmapped direct-heap accesses currently share a generic null view descriptor, so type-specific null behaviour may still need work. Keep the runtime's fail-closed checks for shaders that were translated without remapping metadata.
 
 ### Other recent graphics/runtime changes
 
@@ -44,7 +50,7 @@ The goal is not simply to make the game start. The goal is to make it render cor
 
 Development priorities:
 
-1. **Descriptor and resource correctness** — finish the logical-to-physical mapping path, resource lifetime handling, and direct heap indexing.
+1. **Descriptor and resource correctness** — validate the new logical-to-physical mapping path on the GPU and in the retail game; address descriptor typing, residency coverage, resource lifetime, and synchronization gaps found by runtime testing.
 2. **Shader translation** — improve coverage and correctness for the console's shader instructions and execution model.
 3. **Lighting and image quality** — bring up the title's ray-traced lighting, shadows, reflections, and related effects.
 4. **Runtime compatibility** — implement missing console interfaces and correct memory, file, and system behaviour.
