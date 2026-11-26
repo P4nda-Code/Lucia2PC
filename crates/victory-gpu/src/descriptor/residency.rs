@@ -320,6 +320,23 @@ impl MappingSnapshot {
         &self.lease.map
     }
 
+    /// Copies the complete logical-to-physical table into a GPU upload
+    /// mapping. The caller must keep this snapshot alive until the GPU has
+    /// finished reading the copied table, so its physical descriptor slots
+    /// cannot be recycled while commands still refer to them.
+    ///
+    /// Returns the required dword count without modifying the destination
+    /// when it is too short. Any destination tail beyond the logical heap
+    /// is left untouched.
+    pub(crate) fn copy_encoded_to(&self, destination: &mut [u32]) -> Result<(), usize> {
+        let required = self.lease.map.len();
+        if destination.len() < required {
+            return Err(required);
+        }
+        destination[..required].copy_from_slice(&self.lease.map);
+        Ok(())
+    }
+
     pub(crate) fn lookup(&self, logical: u32) -> Mapping {
         match self.lease.map.get(logical as usize) {
             Some(&UNMAPPED_DESCRIPTOR) => Mapping::Unresident,
@@ -415,6 +432,32 @@ mod tests {
         assert_eq!(second.lookup(PREFIX), Mapping::Resident(new));
         drop(first);
         assert_eq!(r.map(12, 12).unwrap(), old);
+    }
+
+    #[test]
+    fn gpu_table_copy_preserves_resident_and_unmapped_entries() {
+        let r = Residency::new(8, Arc::new(PhysicalSlots::new(128, 2).unwrap()));
+        let first = r.map(2, 20).unwrap();
+        let second = r.map(7, 70).unwrap();
+        let snapshot = r.snapshot();
+
+        let mut destination = [0xfeed_beef; 10];
+        snapshot.copy_encoded_to(&mut destination).unwrap();
+
+        assert_eq!(destination[0], UNMAPPED_DESCRIPTOR);
+        assert_eq!(destination[2], first);
+        assert_eq!(destination[7], second);
+        assert_eq!(destination[8..], [0xfeed_beef; 2]);
+    }
+
+    #[test]
+    fn gpu_table_copy_rejects_short_destination_without_partial_write() {
+        let r = Residency::new(8, Arc::new(PhysicalSlots::new(128, 1).unwrap()));
+        let snapshot = r.snapshot();
+        let mut destination = [0xfeed_beef; 7];
+
+        assert_eq!(snapshot.copy_encoded_to(&mut destination), Err(8));
+        assert_eq!(destination, [0xfeed_beef; 7]);
     }
 
     #[test]
