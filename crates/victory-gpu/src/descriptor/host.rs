@@ -1013,6 +1013,10 @@ impl HostHeap {
             .invalidate(logical)
     }
 
+    pub(crate) fn residency_version(&self) -> Option<u64> {
+        self.residency.as_ref().map(Residency::version)
+    }
+
     pub(crate) fn residency_snapshot(&self) -> Option<super::residency::MappingSnapshot> {
         let snapshot = self.residency.as_ref()?.snapshot();
         let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
