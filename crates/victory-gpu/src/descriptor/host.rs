@@ -921,8 +921,10 @@ impl HostHeap {
     pub(crate) fn pending_residency(&self, max: usize) -> Vec<u32> {
         let mut pending = self.pending_residency.lock().unwrap_or_else(|e| e.into_inner());
         let mut ready = Vec::with_capacity(max.min(pending.0.len()));
-        while ready.len() < max {
+        let mut examined = 0;
+        while ready.len() < max && examined < max.saturating_mul(8) {
             let Some(logical) = pending.0.pop_front() else { break };
+            examined += 1;
             if pending.1.remove(&logical) {
                 ready.push(logical);
             }
