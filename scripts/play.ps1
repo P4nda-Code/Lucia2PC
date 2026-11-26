@@ -3,8 +3,16 @@ param(
     [Parameter(Mandatory = $true)][string]$Game,
     [string]$Cache = "$env:LOCALAPPDATA\Lucia2PC\cache",
     [string]$Data = "$env:LOCALAPPDATA\Lucia2PC\data",
-    [string]$Exe = "$PSScriptRoot\..\target\release\victory.exe"
+    [string]$Exe = ""
 )
+if ([string]::IsNullOrWhiteSpace($Exe)) {
+    $scriptDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
+    $repositoryDirectory = Split-Path -Parent $scriptDirectory
+    $Exe = Join-Path $repositoryDirectory "target\release\victory.exe"
+}
+if (-not (Test-Path -LiteralPath $Exe -PathType Leaf)) {
+    throw "Lucia2PC executable not found: $Exe. Build it with cargo build --release -p victory."
+}
 foreach ($v in "VICTORY_KEYS", "VICTORY_CAPTURE", "VICTORY_CAPTURE_FRAMES", "VICTORY_DUMP_TARGETS") {
     Remove-Item "Env:$v" -ErrorAction SilentlyContinue
 }
