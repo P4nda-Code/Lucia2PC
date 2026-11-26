@@ -41,16 +41,17 @@ pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
 /// - copy `n` is the raw buffer view at view-heap slot `base + n`, `base`
 ///   the user-data dword of kind [`USER_MEMORY_BASE`]; slot `base` itself
 ///   reads zeros and drops writes;
-/// - the root UAV `u<SLOT_FAULTS>` takes the page numbers of accesses that
-///   found no copy ([`MEMORY_FAULTS`] dwords, dword 0 a sink), which the
-///   host reads afterwards to make those copies for the frames to come.
+/// - the root UAV `u<SLOT_FAULTS>` is a monotonic atomic bitmap of pages
+///   that had no copy ([`MEMORY_FAULTS`] dwords), which the host reads to
+///   make those copies for the frames to come. The host does not clear it,
+///   so a read cannot race with a later in-flight GPU OR.
 pub const SLOT_MEMORY: u8 = 254;
 /// See [`SLOT_MEMORY`].
 pub const SLOT_FAULTS: u8 = 253;
 /// Entries of the [`SLOT_MEMORY`] directory: title addresses below 128 GiB.
 pub const MEMORY_PAGES: u32 = 1 << 21;
-/// Dwords of the [`SLOT_FAULTS`] buffer.
-pub const MEMORY_FAULTS: u32 = 4096;
+/// Dwords of the [`SLOT_FAULTS`] buffer: one fault bit for each page.
+pub const MEMORY_FAULTS: u32 = MEMORY_PAGES.div_ceil(32);
 /// `RootType::Other` code of a user-data dword the host computes: the view
 /// heap slot of the memory copies' views ([`SLOT_MEMORY`]).
 pub const USER_MEMORY_BASE: u32 = 0x100;
@@ -124,6 +125,12 @@ static VIEW_LIMIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::
 /// See [`VIEW_LIMIT`]: `null_slot` is the last slot of the host's view heap, kept null.
 pub fn set_view_heap_limit(null_slot: u32) {
     VIEW_LIMIT.store(null_slot, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The null slot used to clamp shader-visible view indices, or zero when
+/// the host has not reported a view-heap limit.
+pub fn view_heap_limit() -> u32 {
+    VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub(crate) struct Shader {

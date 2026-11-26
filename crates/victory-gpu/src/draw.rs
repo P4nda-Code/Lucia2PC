@@ -24,6 +24,15 @@ use crate::host::HostList;
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
 
+/// Whether a root-table access lands outside the physical title prefix of a
+/// partial host descriptor heap. `relative_index` is the descriptor index
+/// emitted by the shader translator for this draw's root constants.
+fn table_access_past_host_prefix(table_index: u32, relative_index: u32, host_count: u32) -> bool {
+    table_index
+        .checked_add(relative_index)
+        .is_none_or(|index| index >= host_count)
+}
+
 /// A root argument as the title set it.
 #[derive(Debug, Clone, Default)]
 enum Root {
@@ -198,6 +207,11 @@ pub(crate) struct State {
     root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
+    /// Immutable descriptor maps attached to this list. `State` moves into
+    /// `list::Detached` at submit time and is dropped/recycled only after the
+    /// host submission has completed, so these leases cannot recycle their
+    /// physical slots while the GPU may still read them.
+    residency: Vec<crate::descriptor::residency::MappingSnapshot>,
 }
 
 impl Drop for State {
@@ -209,6 +223,31 @@ impl Drop for State {
 }
 
 impl State {
+    /// Makes one logical descriptor resident and retains the resulting
+    /// immutable map for this recording. A translated shader path must use
+    /// the returned physical slot through the matching snapshot.
+    pub(crate) fn make_resident(
+        &mut self,
+        heap: usize,
+        logical: u32,
+        handle: u64,
+    ) -> Result<u32, crate::descriptor::residency::ResidencyError> {
+        let physical = crate::descriptor::make_resident(heap, logical, handle)?;
+        let snapshot = crate::descriptor::residency_snapshot(heap)
+            .ok_or(crate::descriptor::residency::ResidencyError::DescriptorCopyFailed)?;
+        self.residency.push(snapshot);
+        Ok(physical)
+    }
+
+    /// Retains a mapping for commands recorded on this list. The detached
+    /// state holds it through the existing queue completion boundary.
+    pub(crate) fn retain_residency(
+        &mut self,
+        snapshot: crate::descriptor::residency::MappingSnapshot,
+    ) {
+        self.residency.push(snapshot);
+    }
+
     /// The list's submission has run (submissions are waited for): the
     /// dynamic slots its tables were made in are given back, not kept
     /// until the title resets the list. A frame of the opening cutscene
@@ -217,7 +256,7 @@ impl State {
     /// shortcut: a list the title runs a second time without a reset then
     /// reads slots others may have taken (logged once).
     pub(crate) fn tables_done(&mut self) {
-        if self.tables_gone && self.dynamic.is_empty() {
+        if self.tables_gone && self.dynamic.is_empty() && self.residency.is_empty() {
             return;
         }
         if self.tables_gone {
@@ -230,6 +269,7 @@ impl State {
         self.fresh_tables.clear();
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
+        self.residency.clear();
         self.tables_gone = true;
     }
 }
@@ -720,7 +760,15 @@ impl State {
     /// For a shader that reads title memory by address
     /// ([`crate::memory`]): its directory, fault notes and view slots,
     /// with the pages of the root views the list has set made ready.
-    fn memory_ready(&self, list: &HostList, compute: bool, writes: bool) -> Option<crate::memory::Ready> {
+    fn memory_ready(
+        &self,
+        list: &HostList,
+        compute: bool,
+        pipeline: &HostPipeline,
+        used: &[UsedResource],
+        indexed: &[RootIndexedView],
+        writes: bool,
+    ) -> Option<crate::memory::Ready> {
         let heap = match self.heaps[0] {
             0 => None,
             h => crate::descriptor::heap(h as This).host(),
@@ -733,7 +781,127 @@ impl State {
                 _ => {}
             }
         }
-        crate::memory::ready(list, heap, &addresses, &constants, writes)
+        let required = if crate::pipeline::is_builder(self.pipeline as This) {
+            self.builder_memory_ranges(compute, used, indexed)
+        } else {
+            Vec::new()
+        };
+        let ready = crate::memory::ready(list, heap, &addresses, &constants, &required, writes)?;
+        self.trace_memory_dispatch(compute, pipeline);
+        Some(ready)
+    }
+
+    /// Opt-in CPU-side provenance for dispatches that use raw title memory.
+    /// This narrows the pipeline/root arguments around a later GPU page-fault
+    /// report without adding shader instructions or changing resource state.
+    fn trace_memory_dispatch(&self, compute: bool, pipeline: &HostPipeline) {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        if !*ENABLED.get_or_init(|| {
+            std::env::var_os("LUCIA_MEMORY_FAULT_TRACE").is_some_and(|v| v == "1")
+        }) {
+            return;
+        }
+        let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let shaders = pipeline
+            .stages
+            .iter()
+            .filter(|stage| {
+                stage
+                    .translated()
+                    .host
+                    .root_srvs
+                    .contains(&victory_shader::emit::SLOT_MEMORY)
+            })
+            .map(|stage| {
+                (
+                    stage.shader.hash.as_str(),
+                    stage.shader.stage,
+                    &stage.translated().used,
+                )
+            })
+            .collect::<Vec<_>>();
+        let roots = self
+            .roots_ref(compute)
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, root)| match root {
+                Root::View(address) => Some(format!("view[{slot}]={address:#x}")),
+                Root::Constants(values) => Some(format!("constants[{slot}]={values:x?}")),
+                Root::Table(table) => Some(format!("table[{slot}]={table:#x}")),
+                Root::None => None,
+            })
+            .collect::<Vec<_>>();
+        tracing::info!(
+            sequence,
+            frame = crate::frame::current(),
+            compute,
+            pipeline = %pipeline.name,
+            shaders = ?shaders,
+            roots = ?roots,
+            "raw title-memory dispatch trace"
+        );
+    }
+
+    /// Builder table-backed buffer allocations are known before dispatch
+    /// from native shader resource metadata. Their complete backing ranges
+    /// are prepared before execution so raw pointer loads into these
+    /// allocations cannot fault on their first page. Pointer targets in
+    /// separate allocations still require explicit metadata.
+    fn builder_memory_ranges(
+        &self,
+        compute: bool,
+        used: &[UsedResource],
+        indexed: &[RootIndexedView],
+    ) -> Vec<(u64, u64)> {
+        let mut ranges = Vec::new();
+        let mut add = |handle: u64| {
+            if let Some(view) = crate::descriptor::view(handle)
+                && let Some(range) = crate::descriptor::host::buffer_extent(&view)
+                && range.1 != 0
+            {
+                ranges.push(range);
+            }
+        };
+        for u in used.iter().filter(|u| {
+            u.root == RootType::Table
+                && matches!(u.kind, ResourceType::Srv | ResourceType::Uav)
+        }) {
+            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
+                continue;
+            };
+            if let Some(offset) = u64::from(u.table_offset_dwords).checked_mul(4)
+                && let Some(handle) = table.checked_add(offset)
+            {
+                add(handle);
+            }
+        }
+        for view in indexed {
+            let Some(&Root::Table(table)) = self
+                .roots_ref(compute)
+                .get(usize::from(view.table_slot))
+            else {
+                continue;
+            };
+            let constant = self.user_value(
+                compute,
+                view.constant_slot,
+                RootType::Constants,
+                view.constant_dword,
+            );
+            let descriptor = view
+                .byte_offset
+                .wrapping_add(constant.wrapping_shl(u32::from(view.shift)))
+                / 32;
+            if let Some(offset) = u64::from(descriptor).checked_mul(32)
+                && let Some(handle) = table.checked_add(offset)
+            {
+                add(handle);
+            }
+        }
+        ranges.sort_unstable();
+        ranges.dedup();
+        ranges
     }
 
     /// The bound heap holding `handle`.
@@ -849,6 +1017,37 @@ impl State {
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
+        // Require a host heap for every title heap. A logical heap larger
+        // than its physical mirror is safe for root tables because tables()
+        // relocates and patches those ranges. A global SM 6.6 ResourceHeap
+        // index is computed at run time and cannot be relocated that way.
+        for &h in self.heaps.iter().filter(|&&h| h != 0) {
+            let title_heap = crate::descriptor::heap(h as This);
+            let Some(host_heap) = title_heap.host() else {
+                once!(
+                    "a draw or dispatch whose shader-visible descriptor heap has no host mirror was dropped"
+                );
+                return false;
+            };
+            if !title_heap.samplers()
+                && title_heap.count() > host_heap.count()
+                && p.stages.iter().any(|stage| stage.translated().uses_resource_heap)
+            {
+                let shaders = p
+                    .stages
+                    .iter()
+                    .filter(|stage| stage.translated().uses_resource_heap)
+                    .map(|stage| (stage.shader.stage, stage.shader.hash.as_str()))
+                    .collect::<Vec<_>>();
+                once!(
+                    logical = title_heap.count(),
+                    physical = host_heap.count(),
+                    ?shaders,
+                    "a draw or dispatch uses direct ResourceHeap indexing beyond the physical host prefix and was dropped"
+                );
+                return false;
+            }
+        }
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
         if self.host_heaps != self.heaps {
@@ -911,7 +1110,14 @@ impl State {
                 && !crate::pipeline::builder_quarantined(self.pipeline as This);
             // Title memory by address: what the shader finds it by.
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
-                let Some(ready) = self.memory_ready(list, compute, writes) else {
+                let Some(ready) = self.memory_ready(
+                    list,
+                    compute,
+                    p,
+                    &t.used,
+                    &t.host.root_indexed_views,
+                    writes,
+                ) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return false;
                 };
@@ -1899,6 +2105,46 @@ impl State {
                 fresh.push(u.slot);
             }
         }
+        // A table can begin in the physical title prefix while an indexed
+        // access in that same table crosses into the unmirrored portion of
+        // the logical heap. `used` only describes statically identified
+        // resources; these accesses are recorded separately by the shader
+        // translator, so include their draw-time indices in the relocation
+        // decision too.
+        for index in indexed {
+            if fresh.contains(&index.table_slot) {
+                continue;
+            }
+            let Some(&Root::Table(table)) = self
+                .roots_ref(compute)
+                .get(usize::from(index.table_slot))
+            else {
+                continue;
+            };
+            let Some(heap) = self.heap_of(table) else {
+                continue;
+            };
+            let Some(host) = heap.host() else {
+                continue;
+            };
+            let constant = self.user_value(
+                compute,
+                index.constant_slot,
+                RootType::Constants,
+                index.constant_dword,
+            );
+            // Match the translated shader's 32-bit byte-offset arithmetic.
+            let descriptor = index.byte_offset.wrapping_add(constant << index.shift) / 32;
+            let Some(table_index) = heap.index(table) else {
+                // The table builder below will reject an invalid indexed
+                // descriptor range; route it through that checked path.
+                fresh.push(index.table_slot);
+                continue;
+            };
+            if table_access_past_host_prefix(table_index, descriptor, host.count()) {
+                fresh.push(index.table_slot);
+            }
+        }
         fresh.sort_unstable();
         fresh.dedup();
         for u in used.iter().filter(tables) {
@@ -1953,6 +2199,7 @@ impl State {
                 || last.and_then(|handle| heap.index(handle)).is_none()
             {
                 once!(slot, n, "fresh descriptor table exceeds the available span");
+                made.push((slot, u32::MAX));
                 continue;
             }
             // The table and what its entries hold (record words).
@@ -2689,4 +2936,43 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     crate::capture::op(std::ptr::from_ref(list) as usize, || format!("STENCIL REF {reference:#x}"));
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+#[cfg(test)]
+mod residency_lifetime_tests {
+    use super::State;
+    use crate::descriptor::residency::{PhysicalSlots, Residency, ResidencyError};
+
+    #[test]
+    fn draw_state_holds_mapping_lease_until_completion_hook() {
+        let residency = Residency::new(4, std::sync::Arc::new(PhysicalSlots::new(16, 1).unwrap()));
+        let physical = residency.map(1, 100).unwrap();
+        let mut submitted_state = State::default();
+        submitted_state.retain_residency(residency.snapshot());
+        residency.invalidate(1).unwrap();
+
+        assert_eq!(
+            residency.map(2, 200),
+            Err(ResidencyError::CapacityExhausted),
+            "the detached command-list state still owns the submitted snapshot"
+        );
+        // Production calls `tables_done` only after the synchronous queue
+        // execution has waited for its host fence.
+        submitted_state.tables_done();
+        assert_eq!(residency.map(2, 200).unwrap(), physical);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::table_access_past_host_prefix;
+
+    #[test]
+    fn indexed_root_table_relocates_when_only_the_selected_entry_crosses_prefix() {
+        const PREFIX: u32 = 737_855;
+        assert!(!table_access_past_host_prefix(PREFIX - 1, 0, PREFIX));
+        assert!(table_access_past_host_prefix(PREFIX - 1, 1, PREFIX));
+        assert!(table_access_past_host_prefix(PREFIX, 0, PREFIX));
+        assert!(table_access_past_host_prefix(u32::MAX, 1, PREFIX));
+    }
 }

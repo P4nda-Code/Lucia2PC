@@ -639,6 +639,10 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    // Raw-address shader mappings follow virtual pages. A remap can change
+    // the bytes behind the same address, so retire those directory entries
+    // after prior GPU submissions finish.
+    crate::memory::invalidate(at as u64, len as u64);
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);

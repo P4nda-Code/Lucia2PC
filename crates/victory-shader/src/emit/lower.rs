@@ -2631,7 +2631,7 @@ impl<'a> Lower<'a> {
     /// (and drops writes) through the null view at the first slot, and its
     /// number is left for the host, for lanes that run (`guard`).
     fn memory(&mut self, lo: V, hi: V, guard: Option<V>) -> (V, V) {
-        use super::shader::{MEMORY_FAULTS, MEMORY_PAGES, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE};
+        use super::shader::{MEMORY_PAGES, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE};
         let c = self.cur;
         let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
@@ -2661,30 +2661,28 @@ impl<'a> Lower<'a> {
         );
         let (copy, start) = (self.s.m.extract(c, entry, 0), self.s.m.extract(c, entry, 1));
         let (copy, start) = (self.as_int(copy), self.as_int(start));
-        // A page without a copy: its number, at a place by the number, or
-        // at the sink for lanes that do not run and pages that have one.
+        // A page without a copy: atomically set its bit in the fault
+        // bitmap. Simultaneous misses cannot overwrite one another.
         let zero = k(self, 0);
         let mut missing = self.s.m.cmp(c, pred::EQ, copy, zero);
         if let Some(g) = guard {
             missing = self.s.m.bin(c, Bin::And, missing, g);
         }
-        let places = k(self, MEMORY_FAULTS - 1);
-        let place = self.s.m.bin(c, Bin::URem, page, places);
-        let one = k(self, 1);
-        let place = self.s.m.bin(c, Bin::Add, place, one);
-        let k2 = k(self, 2);
-        let place = self.s.m.bin(c, Bin::Shl, place, k2);
-        let place = self.s.m.select(c, missing, place, zero);
+        let (shift5, mask31, one, shift2) = (k(self, 5), k(self, 31), k(self, 1), k(self, 2));
+        let word = self.s.m.bin(c, Bin::LShr, page, shift5);
+        let bit_index = self.s.m.bin(c, Bin::And, page, mask31);
+        let bit = self.s.m.bin(c, Bin::Shl, one, bit_index);
+        let place = self.s.m.bin(c, Bin::Shl, word, shift2);
         let faults = self.s.root_uav_handle(SLOT_FAULTS);
-        let void = self.s.t.void;
-        let mask = self.s.m.i8(1);
+        let value = self.s.m.select(c, missing, bit, zero);
+        let op = k(self, 2); // DXIL atomic OR.
         self.s.op(
             c,
-            "rawBufferStore.i32",
+            "atomicBinOp.i32",
             Attr::NoUnwind,
-            void,
-            140,
-            &[faults, place, iu, page, iu, iu, iu, mask, align],
+            i32t,
+            78,
+            &[faults, op, place, iu, iu, value],
         );
         let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
         let slot = self.s.m.bin(c, Bin::Add, base, copy);

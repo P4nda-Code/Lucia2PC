@@ -12,6 +12,7 @@ use crate::resource::{Memory, PAGEABLE_IIDS};
 
 #[cfg(windows)]
 pub(crate) mod host;
+pub(crate) mod residency;
 
 const HEAP_IIDS: [Iid; 4] = [
     guid(
@@ -70,6 +71,11 @@ impl Heap {
     /// Whether this is a sampler heap.
     pub(crate) fn samplers(&self) -> bool {
         self.desc.kind == SAMPLERS
+    }
+
+    /// Logical title descriptor count, independent of the host mirror size.
+    pub(crate) fn count(&self) -> u32 {
+        self.desc.count
     }
 
     /// The host heap, made on first use from what the title wrote so far.
@@ -155,6 +161,49 @@ fn mirror(handle: u64) {
     }
 }
 
+/// Withdraws a logical mapping before the title's descriptor bytes change.
+#[cfg(windows)]
+fn invalidate_residency(handle: u64) {
+    let Some((heap, index)) = shader_slot(handle) else { return };
+    if let Some(Some(host)) = heap.host.get() {
+        let _ = host.invalidate_resident(index);
+    }
+}
+
+/// Installs the current logical descriptor in the shared physical pool and
+/// publishes its mapping only after the D3D12 copy succeeds.
+#[cfg(windows)]
+pub(crate) fn make_resident(
+    heap: usize,
+    logical: u32,
+    handle: u64,
+) -> Result<u32, residency::ResidencyError> {
+    if heap == 0 {
+        return Err(residency::ResidencyError::InvalidLogicalIndex);
+    }
+    // SAFETY: only registered title heaps are passed by draw state.
+    let title = unsafe { &*(heap as *const Heap) };
+    if logical >= title.desc.count || title.samplers() || title.index(handle) != Some(logical) {
+        return Err(residency::ResidencyError::InvalidLogicalIndex);
+    }
+    title
+        .host()
+        .ok_or(residency::ResidencyError::DescriptorCopyFailed)?
+        .make_resident(logical, handle)
+}
+
+/// Takes an immutable mapping snapshot for a command-list submission.
+#[cfg(windows)]
+pub(crate) fn residency_snapshot(heap: usize) -> Option<residency::MappingSnapshot> {
+    if heap == 0 {
+        return None;
+    }
+    // SAFETY: only registered title heaps are passed by draw state.
+    unsafe { &*(heap as *const Heap) }
+        .host()?
+        .residency_snapshot()
+}
+
 /// Gives back dynamic slots of the host heap behind the title heap at
 /// `heap`, if that heap still exists.
 #[cfg(windows)]
@@ -171,6 +220,12 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
 #[cfg(windows)]
 impl Drop for Heap {
     fn drop(&mut self) {
+        // The shader-visible host heap owns the physical residency pool,
+        // staging heap, and resident resource references. Keep all of them
+        // through submissions already recorded against this title heap.
+        if let Some(Some(host)) = self.host.take() {
+            crate::host::retire(host);
+        }
         let at = std::ptr::from_ref::<Heap>(self) as usize;
         let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
         heaps.retain(|&(_, _, h)| h != at);
@@ -683,6 +738,8 @@ fn record(handle: u64, view: View) {
     if handle == 0 {
         return;
     }
+    #[cfg(windows)]
+    invalidate_residency(handle);
     let [i, generation] = words_for(view);
     // SAFETY: the handle is a descriptor slot, at least 16 bytes.
     unsafe { (handle as *mut [u32; 3]).write_unaligned([VIEW_TAG, i, generation]) };
@@ -825,6 +882,10 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
     let step = u64::from(increment(kind).unwrap_or(0));
     let len = u64::from(count) * step;
     if dst != 0 && src != 0 {
+        #[cfg(windows)]
+        for i in 0..u64::from(count) {
+            invalidate_residency(dst + i * step);
+        }
         // SAFETY: both ranges are descriptor slots the title owns.
         unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len as usize) };
         #[cfg(windows)]
@@ -1027,6 +1088,29 @@ mod tests {
         assert_eq!(increment_size(null, 9), 0);
         let bad = HeapDesc { kind: 9, ..desc };
         assert_eq!(create(bad, none, &mut h), E_INVALIDARG);
+    }
+
+    #[test]
+    fn logical_title_heap_keeps_indices_beyond_the_host_portable_limit() {
+        const TITLE_COUNT: u32 = 1_245_184;
+        const OLD_HOST_LIMIT: u32 = 1_000_000;
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count: TITLE_COUNT,
+            flags: SHADER_VISIBLE,
+            nodes: 0,
+        };
+        let none = Placement { address: 0, size: 0 };
+        let mut h = std::ptr::null();
+        assert_eq!(create(desc, none, &mut h), S_OK);
+        let heap = heap(h);
+        let step = u64::from(increment(VIEWS_KIND).unwrap());
+        for index in [OLD_HOST_LIMIT - 1, OLD_HOST_LIMIT, TITLE_COUNT - 1] {
+            let handle = heap.start + u64::from(index) * step;
+            assert_eq!(heap.index(handle), Some(index));
+        }
+        // SAFETY: this test owns the emulated heap object returned above.
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(h, 0x10)(h), 0);
     }
 
     #[test]

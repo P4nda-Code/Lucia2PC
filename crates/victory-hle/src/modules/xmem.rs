@@ -977,6 +977,24 @@ mod tests {
     }
 
     #[test]
+    fn xmem_32bit_allocations_cannot_occupy_the_zero_page() {
+        use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+
+        let mut info: SYSTEM_INFO = unsafe { std::mem::zeroed() };
+        // SAFETY: GetSystemInfo fills this plain output struct.
+        unsafe { GetSystemInfo(&mut info) };
+        let minimum = info.lpMinimumApplicationAddress as usize;
+        assert!(minimum >= 64 * 1024, "minimum application address {minimum:#x}");
+        assert_ne!(query(std::ptr::null()).host.State, MEM_COMMIT);
+
+        let p = XMemAlloc(4096, ALLOC_32BIT);
+        assert!(!p.is_null());
+        assert!(p as usize >= minimum, "32-bit allocation {p:p}");
+        assert!((p as usize) < 1 << 32, "32-bit allocation {p:p}");
+        XMemFree(p, ALLOC_32BIT);
+    }
+
+    #[test]
     fn virtual_alloc_meets_console_constraints() {
         const GPU_READ_WRITE: u32 = 0x2000;
         let p = XMemVirtualAlloc(

@@ -40,9 +40,9 @@ pub(crate) fn counts() -> (u64, u64) {
 /// What identifies this build: the BLAKE3 of our executable file and of
 /// the translation settings it runs with (the loop limit, which a
 /// diagnostics build can change at run time).
-fn build() -> &'static [u8; 32] {
+fn build() -> [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
-    BUILD.get_or_init(|| {
+    let base = BUILD.get_or_init(|| {
         let exe = std::env::current_exe().and_then(std::fs::read);
         let limit = victory_shader::emit::loop_limit();
         if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
@@ -87,7 +87,22 @@ fn build() -> &'static [u8; 32] {
                 *blake3::hash(&now.as_nanos().to_le_bytes()).as_bytes()
             }
         }
-    })
+    });
+    // Unlike the translation switches above, this host limit can be learned
+    // later when creating the title's oversized descriptor heap fails. Read
+    // it on every lookup so subsequent shaders cannot reuse the pre-limit
+    // cache identity after that fallback changes emitted heap indices.
+    translation_key(base, victory_shader::emit::view_heap_limit())
+}
+
+fn append_view_heap_limit(bytes: &mut Vec<u8>, limit: u32) {
+    bytes.extend_from_slice(&limit.to_le_bytes());
+}
+
+fn translation_key(base: &[u8; 32], limit: u32) -> [u8; 32] {
+    let mut bytes = base.to_vec();
+    append_view_heap_limit(&mut bytes, limit);
+    *blake3::hash(&bytes).as_bytes()
 }
 
 /// The translation of a console shader container, from the cache when
@@ -95,7 +110,7 @@ fn build() -> &'static [u8; 32] {
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let translate = translate_listed;
     match CACHE.get() {
-        Some(cache) => cached(cache, build(), container, translate),
+        Some(cache) => cached(cache, &build(), container, translate),
         None => translate(container),
     }
 }
@@ -378,6 +393,14 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn view_heap_limit_is_part_of_translation_identity() {
+        let base = *blake3::hash(b"same executable and settings").as_bytes();
+        let unrestricted = translation_key(&base, 0);
+        let capped = translation_key(&base, 999_999);
+        assert_ne!(unrestricted, capped);
+    }
 
     #[test]
     fn wave_wide_defaults_cover_the_captured_32_lane_failures() {

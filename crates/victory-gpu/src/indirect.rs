@@ -690,7 +690,7 @@ void main() {
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                warp.list.Dispatch(PIECES.div_ceil(64), 1, 1);
+                warp.list.Dispatch(PIECES, 1, 1);
             }
             warp.submit_and_wait();
             // SAFETY: as above.
@@ -718,6 +718,70 @@ void main() {
         set(content[at]);
         assert_eq!(run(&mut warp, 2), [0, 1, 0]);
         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
+    }
+
+    /// A nonzero copy skew and a span beginning after piece zero must keep
+    /// workgroup IDs, byte ranges, and result slots aligned. Probe the edges
+    /// of the 16-byte loads and the 64 KiB piece boundaries.
+    #[test]
+    fn warp_card_compare_handles_skewed_spans_and_partial_pieces() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE)
+            .expect("the card compare must compile on WARP");
+        const PIECE: usize = 64 << 10;
+        const FIRST: u32 = 1;
+        const SKEW: u32 = 16;
+        const PIECES: u32 = 2;
+        const SIZE: usize = PIECE * 3;
+        let (_now, now_ptr, now_gpu) = warp.shared_buffer(SIZE as u64);
+        let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * (FIRST as u64 + PIECES as u64));
+        let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer(64);
+        let content: Vec<u8> = (0..SIZE).map(|i| (i * 17 + i / 97) as u8).collect();
+        // SAFETY: both mappings span `SIZE` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, SIZE) };
+
+        let run = |warp: &mut WarpHarness, mode: u32| -> [u32; PIECES as usize] {
+            // SAFETY: live mappings, aligned root bindings, one group per piece.
+            unsafe {
+                for slot in 0..PIECES as usize {
+                    differs_ptr.cast::<u32>().add(slot).write_volatile(7);
+                }
+                warp.list.SetComputeRootSignature(&compare.root);
+                warp.list.SetPipelineState(&compare.pso);
+                let constants = [FIRST, SKEW, SIZE as u32, PIECES, 0, mode];
+                warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                warp.list.SetComputeRootShaderResourceView(1, now_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                warp.list.Dispatch(PIECES, 1, 1);
+            }
+            warp.submit_and_wait();
+            // SAFETY: the GPU completed before the mapped result is read.
+            [0, 1].map(|slot| unsafe { differs_ptr.cast::<u32>().add(slot).read_volatile() })
+        };
+
+        assert_eq!(run(&mut warp, 0), [7, 7]);
+        assert_eq!(run(&mut warp, 1), [0, 0]);
+        // The title-space boundary between these pieces is byte 65,520
+        // because the copy begins 16 bytes into piece zero.
+        for (at, expected) in [
+            (65_520usize, [1, 0]),
+            (65_535, [1, 0]),
+            (65_536, [1, 0]),
+            (131_055, [1, 0]),
+            (131_056, [0, 1]),
+            (131_071, [0, 1]),
+            (131_072, [0, 1]),
+            (196_591, [0, 1]),
+        ] {
+            // SAFETY: `at` is inside the backing allocation.
+            unsafe { now_ptr.add(at).write_volatile(content[at] ^ 0x80) };
+            assert_eq!(run(&mut warp, 2), expected, "changed byte at {at}");
+            unsafe { now_ptr.add(at).write_volatile(content[at]) };
+            assert_eq!(run(&mut warp, 2), expected, "restored byte at {at}");
+        }
     }
 
     /// The clamp compiles with the system's compiler and the host takes it.

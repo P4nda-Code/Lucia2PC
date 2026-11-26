@@ -1442,11 +1442,12 @@ unsafe impl Send for CardWork {}
 static CARD_WORK: Mutex<Option<CardWork>> = Mutex::new(None);
 
 /// The compare of a declared range of a copy in the card's memory with
-/// its bytes from before, one thread per 64 KiB piece (cut at multiples of
-/// 64 KiB of title memory, as `Shadow::card_piece` cuts them): `differs`
-/// gets a dword per piece, 1 where a byte differs. The offsets are widened
-/// to 16 bytes; buffers are multiples of 64 KiB, and a piece flagged for a
-/// byte just outside the range costs a fetch that finds nothing.
+/// its bytes from before, one group of 64 threads per 64 KiB piece (cut at
+/// multiples of 64 KiB of title memory, as `Shadow::card_piece` cuts them):
+/// `differs` gets a dword per piece, 1 where a byte differs. Each lane
+/// hashes interleaved 16-byte words, then lane zero folds those hashes in
+/// lane order. This hash intentionally differs from the former serial hash;
+/// all stored and compared hashes in a process use this one form.
 pub(crate) const CARD_COMPARE: &str = r#"
 #define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)"
 cbuffer Span : register(b0) {
@@ -1462,11 +1463,12 @@ ByteAddressBuffer now : register(t0);
 // last sent up (or hashed whole, the first time).
 RWByteAddressBuffer hashes : register(u0);
 RWByteAddressBuffer differs : register(u1);
+groupshared uint4 lane_hashes[64];
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= pieces) return;
-    uint piece = first + id.x;
+void main(uint3 group : SV_GroupID, uint3 lane : SV_GroupThreadID) {
+    if (group.x >= pieces) return;
+    uint piece = first + group.x;
     uint lo = piece * 65536u;
     lo = lo > skew ? lo - skew : 0u;
     uint hi = min((piece + 1u) * 65536u - skew, size);
@@ -1474,12 +1476,21 @@ void main(uint3 id : SV_DispatchThreadID) {
     hi = (hi + 15u) & ~15u;
     uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu);
     [loop]
-    for (uint at = lo; at < hi; at += 16u) {
+    for (uint at = lo + lane.x * 16u; at < hi; at += 1024u) {
         h = (h ^ now.Load4(at)) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
         h = h.yzwx ^ (h >> 15);
     }
+    lane_hashes[lane.x] = h;
+    GroupMemoryBarrierWithGroupSync();
+    if (lane.x != 0u) return;
+    h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu);
+    [unroll]
+    for (uint i = 0; i < 64u; ++i) {
+        h = (h ^ lane_hashes[i]) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+        h = h.yzwx ^ (h >> 15);
+    }
     if (compare != 0u) {
-        differs.Store(out_at + id.x * 4u, any(h != hashes.Load4(piece * 16u)) ? 1u : 0u);
+        differs.Store(out_at + group.x * 4u, any(h != hashes.Load4(piece * 16u)) ? 1u : 0u);
         // With the copy-back on its own thread: the next compare of the
         // piece finds what is written from here on.
         if (compare == 2u) hashes.Store4(piece * 16u, h);
@@ -3077,7 +3088,7 @@ impl Host {
                         for run in runs {
                             let constants = [run.first, run.skew, size as u32, run.pieces, 0, 0];
                             list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-                            list.Dispatch(run.pieces.div_ceil(64), 1, 1);
+                            list.Dispatch(run.pieces, 1, 1);
                         }
                     }
                     list.Close()?;
@@ -3162,7 +3173,7 @@ impl Host {
                         list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                         list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        list.Dispatch(r.span.pieces.div_ceil(64), 1, 1);
+                        list.Dispatch(r.span.pieces, 1, 1);
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
                     list.Close()?;
@@ -5791,8 +5802,8 @@ impl Meter {
             }
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
-                 {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
-                 GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
+                 {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} ms in CPU waits for submitted work; \
+                 {back_ms:.1} ms copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
                  {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms;                  texture slots written so far: {placed} placed, {objects} of objects; \
                  textures picked by index: {picked_textures} uploaded so far ({picked_mb} MB), \

@@ -123,9 +123,19 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
 pub(crate) struct Translated {
     pub(crate) host: victory_shader::emit::HostShader,
     pub(crate) used: Vec<victory_shader::UsedResource>,
+    /// Uses the SM 6.6 global resource heap, whose run-time indices cannot
+    /// be enumerated and relocated into the host heap's dynamic table slots.
+    pub(crate) uses_resource_heap: bool,
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
     pub(crate) stores: bool,
+}
+
+#[cfg(windows)]
+fn layout_uses_direct_resource_heap(layout: &[victory_shader::RootParam]) -> bool {
+    layout
+        .iter()
+        .any(|parameter| parameter.root == victory_shader::RootType::ResourceHeap)
 }
 
 #[cfg(windows)]
@@ -183,6 +193,9 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         None => Vec::new(),
     };
     let host = crate::shader_cache::host_shader(container)?;
+    let uses_resource_heap = programs
+        .iter()
+        .any(|program| layout_uses_direct_resource_heap(&program.layout));
     let stores = programs.is_empty() || programs.iter().any(stores);
     let used = programs
         .into_iter()
@@ -194,7 +207,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         })
         .map(|p| p.used)
         .unwrap_or_default();
-    Ok(Translated { host, used, stores })
+    Ok(Translated { host, used, uses_resource_heap, stores })
 }
 
 /// The compute pipelines of the console's ray-tracing structure builder
@@ -736,6 +749,25 @@ mod tests {
 
     use super::*;
     use crate::object::{S_OK, slot};
+
+    #[cfg(windows)]
+    #[test]
+    fn distinguishes_direct_resource_heap_from_relocatable_tables() {
+        let table = victory_shader::RootParam {
+            root: victory_shader::RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        };
+        let direct = victory_shader::RootParam {
+            root: victory_shader::RootType::ResourceHeap,
+            ..table
+        };
+        assert!(!layout_uses_direct_resource_heap(&[table]));
+        assert!(layout_uses_direct_resource_heap(&[table, direct]));
+    }
 
     fn shaders(p: This) -> Vec<(&'static str, Vec<u8>)> {
         pipeline(p)

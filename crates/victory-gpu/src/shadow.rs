@@ -2672,7 +2672,12 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    buffers().remove(&(start, resource));
+    let removed = buffers().remove(&(start, resource));
+    if let Some(shadow) = removed.and_then(|entry| entry.shadow) {
+        // A raw-address page directory may still name this host copy. It is
+        // retired only after submissions using the shared directory settle.
+        crate::memory::retire(&shadow);
+    }
 }
 
 /// The title buffer holding `address`, as (start, length), without making

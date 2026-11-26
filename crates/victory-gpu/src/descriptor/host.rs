@@ -5,12 +5,13 @@
 //! writes it (view creation and descriptor copies) and again when a draw
 //! reads it through a table and finds the slot changed.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
 use super::{VIEW_TAG, View, view_at};
+use super::residency::{PhysicalSlots, Residency};
 use crate::host::host;
 
 pub(crate) struct HostHeap {
@@ -26,29 +27,21 @@ pub(crate) struct HostHeap {
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
+    /// Version of an in-progress unlocked mirror operation for each slot.
+    /// `made == 0` is also used for a deferred texture/buffer view, so it
+    /// cannot by itself distinguish two concurrent deferred claims.
+    claims: Vec<std::sync::atomic::AtomicU64>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
     /// read there is a GPU page fault (the console reads stale memory).
-    kept: Mutex<Vec<Option<ID3D12Resource>>>,
-    /// Where the search for free dynamic slots starts, and which are taken
-    /// (by lists not yet reset).
-    next: Mutex<(u32, Vec<bool>)>,
-    /// How many dynamic slots are free (changed under `next`'s lock): with
-    /// fewer than a table needs, the search is not made. Once the world
-    /// had taken them all, every later table of the frame searched every
-    /// slot before it was refused.
-    free: std::sync::atomic::AtomicU32,
-    /// The shortest table that found no run of free slots since slots were
-    /// last given back (changed under `next`'s lock; `u32::MAX`: none).
-    /// Until something is given back the free runs only shrink, so a table
-    /// of that length or longer is refused without the search. Enough
-    /// slots were free, but in pieces, and every such table walked the
-    /// whole ring before it was refused: 0.33 ms each with 131,072 slots,
-    /// 1.0 s of the recording threads in a frame that refused 3,143 (run
-    /// 45), under the lock all of them need. (A free run that lies across
-    /// the place the search starts from is seen by neither.)
-    too_long: std::sync::atomic::AtomicU32,
+    kept: Arc<Mutex<Vec<Option<ID3D12Resource>>>>,
+    /// Authoritative allocation domain shared with direct-index residency.
+    slots: Arc<PhysicalSlots>,
+    /// Logical view mappings for descriptors copied into `slots`.
+    residency: Option<Residency>,
+    staging: Option<ID3D12DescriptorHeap>,
+    staging_next: Mutex<u32>,
     /// View heaps: the bytes per element of the buffer view at each title
     /// slot, for shaders that pick a buffer by an index they compute
     /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
@@ -87,6 +80,19 @@ pub(crate) struct HostHeap {
     /// runtime maps, unmaps or writes memory ([`remapped`]).
     placed: Mutex<Spans>,
 }
+
+/// COM references copied into a mapping snapshot. D3D12 devices, heaps and
+/// resources are free-threaded; the list holds this owner through completion.
+struct ResidencyKeepalive {
+    _heap: ID3D12DescriptorHeap,
+    _resources: Vec<ID3D12Resource>,
+}
+
+// SAFETY: D3D12 COM interfaces are free-threaded; references are only cloned
+// and released, while the GPU heap contents remain lease-protected.
+unsafe impl Send for ResidencyKeepalive {}
+// SAFETY: as above.
+unsafe impl Sync for ResidencyKeepalive {}
 
 /// Title memory by the placed texture views that describe it: per span of
 /// memory (its start, its end) the title slots holding a view of a
@@ -309,6 +315,18 @@ pub(crate) struct TextureQueue {
     writes: u64,
 }
 
+/// Whether a due slot that has been retried should share the pass budget
+/// with slots not yet examined. Set `VICTORY_FAIR_DUE=0` to retain the
+/// legacy retry-first ordering for diagnosis.
+fn fair_due_setting(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_none_or(|v| v != "0")
+}
+
+fn fair_due() -> bool {
+    static FAIR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FAIR.get_or_init(|| fair_due_setting(std::env::var_os("VICTORY_FAIR_DUE").as_deref()))
+}
+
 impl TextureQueue {
     /// A texture view was written into slot `index` in `frame`, due from
     /// frame `due`. `seen`: it was not written, a draw or the pass made
@@ -337,7 +355,16 @@ impl TextureQueue {
     ///   25,000-40,000 while the textures of the shot on screen waited
     ///   (run 52: 98% of the drawn pixels had no colour texture in the
     ///   first 3D frames).
+    /// Fair retry/fresh interleaving follows VICTORY-NVIDIA commit
+    /// `77e13a974aed142f5d9f8b80d54ed6de41bfa140` (GPL-3.0).
     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
+        self.due_with_fairness(frame, max, fair_due())
+    }
+
+    fn due_with_fairness(&self, frame: u64, max: usize, fair: bool) -> Vec<(u32, u64)> {
+        if max == 0 {
+            return Vec::new();
+        }
         let mut again: Vec<(u64, u32, u64)> = Vec::new();
         let mut fresh: Vec<(u64, u32, u64)> = Vec::new();
         for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
@@ -348,15 +375,32 @@ impl TextureQueue {
         let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
         again.sort_unstable_by(newest_first);
         fresh.sort_unstable_by(newest_first);
-        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
         let (mut new, mut old) = (0, fresh.len());
-        while new < old && order.len() < max {
-            order.push((fresh[new].1, fresh[new].2));
+        let mut fresh_order = Vec::with_capacity(fresh.len().min(max));
+        while new < old && fresh_order.len() < max {
+            fresh_order.push((fresh[new].1, fresh[new].2));
             new += 1;
-            if new < old && order.len() < max {
+            if new < old && fresh_order.len() < max {
                 old -= 1;
-                order.push((fresh[old].1, fresh[old].2));
+                fresh_order.push((fresh[old].1, fresh[old].2));
             }
+        }
+        if !fair {
+            let mut order: Vec<_> = again.iter().map(|&(_, index, write)| (index, write)).collect();
+            order.extend(fresh_order);
+            order.truncate(max);
+            return order;
+        }
+        let mut retries = again.iter().map(|&(_, index, write)| (index, write));
+        let mut fresh_order = fresh_order.into_iter();
+        let mut order = Vec::with_capacity(max.min(again.len() + fresh_order.len()));
+        while order.len() < max {
+            let (retry, first_time) = (retries.next(), fresh_order.next());
+            if retry.is_none() && first_time.is_none() {
+                break;
+            }
+            order.extend(retry);
+            order.extend(first_time);
         }
         order.truncate(max);
         order
@@ -517,6 +561,68 @@ pub(crate) fn near_heaps(va: u64) -> String {
 /// The host's limit for shader-visible view heaps on resource binding
 /// tiers 1 and 2; tier 3 hardware may take more.
 const PORTABLE_VIEWS: u32 = 1_000_000;
+/// CPU-only staging descriptors used for immediate copies into the shared
+/// shader-visible allocation pool.
+const RESIDENCY_STAGING: u32 = 256;
+
+fn host_descriptor_count(title_count: u32, sampler: bool) -> Option<u32> {
+    title_count.checked_add(if sampler { 0 } else { DYNAMIC })
+}
+
+/// Serialize descriptor creation per slot while allowing unrelated slots
+/// to be mirrored without holding the heap-wide slot-state lock.
+static MIRROR_STRIPES: [Mutex<()>; 256] = [const { Mutex::new(()) }; 256];
+
+fn mirror_stripe(index: u32) -> std::sync::MutexGuard<'static, ()> {
+    MIRROR_STRIPES[index as usize % MIRROR_STRIPES.len()]
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// Runs a stale-slot cleanup under its stripe only while the slot is still
+/// unmade and its claim version is unchanged since invalidation. The closure
+/// may write the host descriptor.
+fn with_unclaimed_slot(
+    made: &Mutex<Vec<u64>>,
+    version: &std::sync::atomic::AtomicU64,
+    expected_version: u64,
+    index: u32,
+    cleanup: impl FnOnce(),
+) -> bool {
+    let _stripe = mirror_stripe(index);
+    let made = made.lock().unwrap_or_else(|e| e.into_inner());
+    if made.get(index as usize) != Some(&0)
+        || version.load(std::sync::atomic::Ordering::Acquire) != expected_version
+    {
+        return false;
+    }
+    cleanup();
+    true
+}
+
+fn mirror_unlocked_setting(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_none_or(|value| value != "0")
+}
+
+fn next_claim_version(claim: &std::sync::atomic::AtomicU64) -> u64 {
+    claim.fetch_add(1, std::sync::atomic::Ordering::AcqRel).wrapping_add(1)
+}
+
+fn claim_is_current(
+    made: u64,
+    expected: u64,
+    version: &std::sync::atomic::AtomicU64,
+    claim: u64,
+) -> bool {
+    made == expected && version.load(std::sync::atomic::Ordering::Acquire) == claim
+}
+
+/// `LUCIA_MIRROR_UNLOCKED=0` keeps the original heap-wide critical section.
+/// The unlocked path avoids holding `made` across D3D12 descriptor creation.
+fn mirror_unlocked() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| mirror_unlocked_setting(std::env::var_os("LUCIA_MIRROR_UNLOCKED").as_deref()))
+}
 
 /// Asks the host, once, whether it caps view heaps at [`PORTABLE_VIEWS`],
 /// and if so tells the translator now (`set_view_heap_limit`) instead of
@@ -583,19 +689,34 @@ impl HostHeap {
             }
         };
         let extra = if sampler { 0 } else { DYNAMIC };
-        let (heap, count, size) = match make(count + extra) {
-            Ok(heap) => (heap, count, count + extra),
-            Err(e) if !sampler && count + extra > PORTABLE_VIEWS => {
-                // shortcut: descriptors past the host's limit are left out; a title that reaches
-                // them needs remapping. The heap's last slot stays null, and shaders read it for
-                // any view index from there on (`set_view_heap_limit`): a read past the heap's
-                // end hung NVIDIA's GPU (the title's heap is a little over 1 000 000 views).
-                tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}; views past it read a null slot");
+        let Some(requested) = host_descriptor_count(count, sampler) else {
+            tracing::error!(count, extra, "host descriptor heap size overflow");
+            return None;
+        };
+        let logical_count = count;
+        let (heap, count, size) = match make(requested) {
+            Ok(heap) => (heap, count, requested),
+            Err(e) if !sampler && requested > PORTABLE_VIEWS => {
+                // Root descriptor tables beyond this physical title prefix
+                // are copied into `dynamic` slots and their root offsets are
+                // patched per draw. SM 6.6 ResourceHeap indices cannot use
+                // that path and are rejected by State::bind when this heap is
+                // incomplete. Keep the final physical slot null for invalid
+                // indices; do not represent it as a valid title slot.
+                tracing::warn!(
+                    error = %e,
+                    title_count = count,
+                    dynamic_reserve = extra,
+                    requested,
+                    conservative_limit = PORTABLE_VIEWS,
+                    "view heap is partially virtualized: overflowing root tables are relocated; direct ResourceHeap access requires a complete host heap"
+                );
                 victory_shader::emit::set_view_heap_limit(PORTABLE_VIEWS - 1);
-                (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - extra - 1, PORTABLE_VIEWS)
+                let title_slots = PORTABLE_VIEWS - extra - 1;
+                (make(PORTABLE_VIEWS).ok()?, title_slots, PORTABLE_VIEWS)
             }
             Err(e) => {
-                tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
+                tracing::warn!(error = %e, count, requested, sampler, "no host descriptor heap");
                 return None;
             }
         };
@@ -628,6 +749,35 @@ impl HostHeap {
                 Some((buffer, gpu, data as usize))
             })
             .flatten();
+        let kept = Arc::new(Mutex::new(vec![None; (count + extra) as usize]));
+        let slots = Arc::new(PhysicalSlots::new(count, extra)?);
+        let release_kept = Arc::clone(&kept);
+        slots.on_release(Arc::new(move |index| {
+            let old = release_kept
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_mut(index as usize)
+                .and_then(Option::take);
+            if let Some(old) = old {
+                crate::host::retire(old);
+            }
+        }));
+        let residency = (!sampler).then(|| Residency::new(logical_count, slots.clone()));
+        let staging = if sampler {
+            None
+        } else {
+            // SAFETY: a CPU-only heap used as the source of immediate copies.
+            Some(unsafe {
+                host.device
+                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                        NumDescriptors: RESIDENCY_STAGING,
+                        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+                        NodeMask: 0,
+                    })
+            }
+            .ok()?)
+        };
         let h = HostHeap {
             heap,
             cpu,
@@ -636,10 +786,14 @@ impl HostHeap {
             dynamic: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
-            kept: Mutex::new(vec![None; (count + extra) as usize]),
-            next: Mutex::new((0, vec![false; DYNAMIC as usize])),
-            free: std::sync::atomic::AtomicU32::new(DYNAMIC),
-            too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
+            claims: (0..count)
+                .map(|_| std::sync::atomic::AtomicU64::new(0))
+                .collect(),
+            kept,
+            slots,
+            residency,
+            staging,
+            staging_next: Mutex::new(0),
             strides,
             buffers: Mutex::default(),
             changed: Mutex::default(),
@@ -722,7 +876,139 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     unsafe { host.device.CreateSampler(&desc, at) };
 }
 
+fn keep_slot_resource(
+    kept: &Mutex<Vec<Option<ID3D12Resource>>>,
+    index: u32,
+    resource: Option<ID3D12Resource>,
+) {
+    let old = {
+        let mut kept = kept.lock().unwrap_or_else(|e| e.into_inner());
+        kept.get_mut(index as usize)
+            .map(|slot| std::mem::replace(slot, resource))
+            .flatten()
+    };
+    if let Some(old) = old {
+        crate::host::retire(old);
+    }
+}
+
 impl HostHeap {
+    /// Copies the current title descriptor into a slot owned by the shared
+    /// physical pool and publishes its logical mapping only after the copy.
+    /// `handle` identifies a live descriptor record, including its generation.
+    pub(crate) fn make_resident(
+        &self,
+        logical: u32,
+        handle: u64,
+    ) -> Result<u32, super::residency::ResidencyError> {
+        let residency = self
+            .residency
+            .as_ref()
+            .ok_or(super::residency::ResidencyError::DescriptorCopyFailed)?;
+        // SAFETY: the caller supplied a title descriptor handle; read the
+        // tag, record index and generation from its descriptor words.
+        let [tag, view_index, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        if tag != VIEW_TAG {
+            return Err(super::residency::ResidencyError::DescriptorCopyFailed);
+        }
+        let view = view_at(view_index, generation)
+            .ok_or(super::residency::ResidencyError::DescriptorCopyFailed)?;
+        let record = u64::from(generation) << 32 | u64::from(view_index);
+        let identity = (u128::from(logical) << 64) | u128::from(record);
+
+        residency.map_with(logical, identity, |physical| {
+            let staging = self
+                .staging
+                .as_ref()
+                .ok_or(super::residency::ResidencyError::DescriptorCopyFailed)?;
+            // Keep the staging slot locked through descriptor creation and
+            // the immediate copy; otherwise a wrapped ring could overwrite
+            // this source before CopyDescriptorsSimple consumes it.
+            let mut next = self.staging_next.lock().unwrap_or_else(|e| e.into_inner());
+            let staging_index = *next;
+            *next = (*next + 1) % RESIDENCY_STAGING;
+            let start = unsafe { staging.GetCPUDescriptorHandleForHeapStart() };
+            let source = D3D12_CPU_DESCRIPTOR_HANDLE {
+                ptr: start.ptr + (staging_index * self.step) as usize,
+            };
+            let retained = make(&view, source)
+                .ok_or(super::residency::ResidencyError::DescriptorCopyFailed)?;
+            if view_at(view_index, generation).as_ref() != Some(&view) {
+                return Err(super::residency::ResidencyError::DescriptorChanged);
+            }
+            // Keep the host resource alive in the same slot whose reuse is
+            // protected by the mapping snapshot's lease.
+            self.copy_descriptor_to_physical(physical, source, retained)?;
+            drop(next);
+            Ok(())
+        })
+    }
+
+    /// Publishes a descriptor already made in a CPU heap. This is shared by
+    /// the view materializer and its D3D12 integration test.
+    fn publish_cpu_descriptor(
+        &self,
+        logical: u32,
+        identity: u128,
+        source: D3D12_CPU_DESCRIPTOR_HANDLE,
+        resource: Option<ID3D12Resource>,
+    ) -> Result<u32, super::residency::ResidencyError> {
+        let residency = self
+            .residency
+            .as_ref()
+            .ok_or(super::residency::ResidencyError::DescriptorCopyFailed)?;
+        residency.map_with(logical, identity, |physical| {
+            self.copy_descriptor_to_physical(physical, source, resource.clone())
+        })
+    }
+
+    fn copy_descriptor_to_physical(
+        &self,
+        physical: u32,
+        source: D3D12_CPU_DESCRIPTOR_HANDLE,
+        resource: Option<ID3D12Resource>,
+    ) -> Result<(), super::residency::ResidencyError> {
+        let Some(host) = host() else {
+            return Err(super::residency::ResidencyError::DescriptorCopyFailed);
+        };
+        // SAFETY: source is a live CPU descriptor and destination is an
+        // allocated slot in this shader-visible view heap.
+        unsafe {
+            host.device.CopyDescriptorsSimple(
+                1,
+                self.cpu(physical),
+                source,
+                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            );
+        }
+        self.keep(physical, resource);
+        Ok(())
+    }
+
+    pub(crate) fn invalidate_resident(
+        &self,
+        logical: u32,
+    ) -> Result<(), super::residency::ResidencyError> {
+        self.residency
+            .as_ref()
+            .ok_or(super::residency::ResidencyError::InvalidLogicalIndex)?
+            .invalidate(logical)
+    }
+
+    pub(crate) fn residency_snapshot(&self) -> Option<super::residency::MappingSnapshot> {
+        let snapshot = self.residency.as_ref()?.snapshot();
+        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        let resources = snapshot
+            .physical_slots()
+            .iter()
+            .filter_map(|&index| kept.get(index as usize).and_then(Clone::clone))
+            .collect();
+        Some(snapshot.with_keepalive(ResidencyKeepalive {
+            _heap: self.heap.clone(),
+            _resources: resources,
+        }))
+    }
+
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
     pub(crate) fn dynamic(&self, n: u32) -> Option<u32> {
@@ -733,32 +1019,8 @@ impl HostHeap {
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicAsked, 1);
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let (next, taken) = &mut *guard;
-        let enough = self.free.load(std::sync::atomic::Ordering::Relaxed) >= n
-            && n < self.too_long.load(std::sync::atomic::Ordering::Relaxed);
-        let n = n as usize;
-        // Search from `next` on, then from the start.
-        let starts = (*next as usize..self.dynamic as usize).chain(0..*next as usize);
-        let mut run = 0;
-        let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts.take(if enough { DYNAMIC as usize } else { 0 }) {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
-            }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
-            }
-        }
-        let Some(first) = found else {
-            if enough {
-                self.too_long.fetch_min(n as u32, std::sync::atomic::Ordering::Relaxed);
-            }
+        let Some(first) = self.slots.allocate(n) else {
+            self.slots.note_fragmented(n);
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
             #[cfg(feature = "diagnostics")]
@@ -771,10 +1033,7 @@ impl HostHeap {
         };
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
-        taken[first..first + n].fill(true);
-        self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
-        *next = ((first + n) % DYNAMIC as usize) as u32;
-        Some(self.count + first as u32)
+        Some(first)
     }
 
     /// The title slots this heap has host slots for; fewer than the title's
@@ -873,6 +1132,8 @@ impl HostHeap {
     /// the host copy can be let go (`crate::resource::let_go_idle`; a slot
     /// keeps what it views). True if the slot was made.
     pub(crate) fn texture_slot_gone(&self, index: u32) -> bool {
+        let _stripe = mirror_stripe(index);
+        self.bump_claim(index);
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         if made.get(index as usize).is_none_or(|&key| key == 0) {
             return false;
@@ -896,6 +1157,27 @@ impl HostHeap {
             None => null_view(self.cpu(index)),
         }
         self.keep(index, None);
+    }
+
+    /// Completes a cross-slot invalidation after releasing the originating
+    /// slot's stripe. A newer mirror claims the slot before writing it and
+    /// makes this cleanup a no-op; taking stripes only after releasing the
+    /// source stripe avoids cycles when two mirrors invalidate each other.
+    fn unmake_if_unclaimed(&self, index: u32, old_key: u64, version: u64) {
+        with_unclaimed_slot(&self.made, &self.claims[index as usize], version, index, || {
+            self.bump_claim(index);
+            match view_at(old_key as u32, (old_key >> 32) as u32) {
+                Some(view) => null_for(&view, self.cpu(index)),
+                None => null_view(self.cpu(index)),
+            }
+            self.keep(index, None);
+        });
+    }
+
+    fn bump_claim(&self, index: u32) -> u64 {
+        self.claims
+            .get(index as usize)
+            .map_or(0, next_claim_version)
     }
 
     /// Title slot `index` is a table's ([`HostHeap::tabled`]). `read`: a
@@ -1081,17 +1363,7 @@ impl HostHeap {
     ///
     /// [`dynamic`]: HostHeap::dynamic
     pub(crate) fn release(&self, first: u32, n: u32) {
-        let Some(at) = first.checked_sub(self.count) else {
-            return;
-        };
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let end = (at + n).min(self.dynamic) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            let given = slots.iter().filter(|taken| **taken).count() as u32;
-            self.free.fetch_add(given, std::sync::atomic::Ordering::Relaxed);
-            self.too_long.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
-            slots.fill(false);
-        }
+        self.slots.release(first, n);
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
@@ -1116,14 +1388,7 @@ impl HostHeap {
 
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
-        let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(slot) = kept.get_mut(index as usize) {
-            // A running submission may still read the old resource through
-            // this slot.
-            if let Some(old) = std::mem::replace(slot, resource) {
-                crate::host::retire(old);
-            }
-        }
+        keep_slot_resource(&self.kept, index, resource);
     }
 
     /// Makes slot `index` (a dynamic one) a raw buffer view of `len` bytes
@@ -1256,6 +1521,10 @@ impl HostHeap {
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+        self.mirror_with_mode(index, handle, for_draw, mirror_unlocked())
+    }
+
+    fn mirror_with_mode(&self, index: u32, handle: u64, for_draw: bool, unlocked: bool) -> Option<View> {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
@@ -1270,6 +1539,7 @@ impl HostHeap {
             }
             return None;
         }
+        let stripe = mirror_stripe(index);
         // SAFETY: the handle is a descriptor slot in title memory.
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
@@ -1279,6 +1549,7 @@ impl HostHeap {
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
+            self.bump_claim(index);
             if made[index as usize] != 0 {
                 made[index as usize] = 0;
                 self.make_null(index);
@@ -1293,9 +1564,19 @@ impl HostHeap {
             // Views of other textures in the memory this one describes
             // are stale: their host slots read nothing from here on, and
             // let go of the host copies they held.
+            let mut deferred = Vec::new();
             for stale in self.note_buffer(index, Some(&view), for_draw) {
                 if stale != index {
-                    self.unmake(&mut made, stale);
+                    if unlocked {
+                        if let Some(old_key) = made.get_mut(stale as usize).map(std::mem::take) {
+                            // Bump even for a zero key: it may be a later
+                            // mirror between its claim and descriptor write.
+                            let version = self.bump_claim(stale);
+                            deferred.push((stale, old_key, version));
+                        }
+                    } else {
+                        self.unmake(&mut made, stale);
+                    }
                 }
             }
             // A view of a texture object that has no host copy yet waits
@@ -1322,12 +1603,49 @@ impl HostHeap {
                 KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Some(view);
             }
-            made[index as usize] = if later { 0 } else { key };
-            let kept = if later {
-                None
-            } else {
-                make(&view, self.cpu(index))
-            };
+            let claim = if later { 0 } else { key };
+            let claim_version = self.bump_claim(index);
+            made[index as usize] = claim;
+            if !unlocked {
+                let kept = if later { None } else { make(&view, self.cpu(index)) };
+                if kept.is_none() && !self.sampler {
+                    null_for(&view, self.cpu(index));
+                }
+                self.keep(index, kept.flatten());
+                return Some(view);
+            }
+            // Descriptor creation can call into the driver. Do it outside
+            // the heap-wide slot lock. Cross-slot invalidations are deferred
+            // until after this stripe is released, then take their own
+            // stripes and skip slots a newer mirror has claimed.
+            drop(made);
+            if deferred.is_empty() {
+                // The common case has no other slot to clean up. Keep this
+                // slot's stripe through the driver call, avoiding a release
+                // and reacquire that another mirror would otherwise race.
+                let kept = if later { None } else { make(&view, self.cpu(index)) };
+                if kept.is_none() && !self.sampler {
+                    null_for(&view, self.cpu(index));
+                }
+                self.keep(index, kept.flatten());
+                return Some(view);
+            }
+            drop(stripe);
+            for (stale, old_key, version) in deferred {
+                self.unmake_if_unclaimed(stale, old_key, version);
+            }
+            let _stripe = mirror_stripe(index);
+            let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            if !claim_is_current(
+                made[index as usize],
+                claim,
+                &self.claims[index as usize],
+                claim_version,
+            ) {
+                return Some(view);
+            }
+            drop(made);
+            let kept = if later { None } else { make(&view, self.cpu(index)) };
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
             }
@@ -2257,6 +2575,252 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn title_heap_plus_dynamic_reserve_uses_checked_host_capacity() {
+        assert_eq!(host_descriptor_count(1_245_184, false), Some(1_507_328));
+        assert_eq!(host_descriptor_count(1_245_184, true), Some(1_245_184));
+        assert_eq!(host_descriptor_count(u32::MAX, false), None);
+    }
+
+    #[test]
+    fn mirror_setting_defaults_on_and_zero_selects_the_locked_path() {
+        use std::ffi::OsStr;
+
+        assert!(mirror_unlocked_setting(None));
+        assert!(!mirror_unlocked_setting(Some(OsStr::new("0"))));
+        assert!(mirror_unlocked_setting(Some(OsStr::new("1"))));
+        assert!(mirror_unlocked_setting(Some(OsStr::new("false"))));
+    }
+
+    #[test]
+    fn a_newer_deferred_claim_invalidates_the_older_claim_even_when_both_are_null() {
+        let version = std::sync::atomic::AtomicU64::new(0);
+        let older = next_claim_version(&version);
+        let newer = next_claim_version(&version);
+        assert!(!claim_is_current(0, 0, &version, older));
+        assert!(claim_is_current(0, 0, &version, newer));
+        // Slot removal and stale cleanup use the same version bump, so an
+        // in-flight deferred descriptor cannot publish after either event.
+        let invalidated = next_claim_version(&version);
+        assert!(!claim_is_current(0, 0, &version, newer));
+        assert!(claim_is_current(0, 0, &version, invalidated));
+    }
+
+    #[test]
+    fn concurrent_deferred_mirrors_publish_only_the_newest_claim() {
+        use std::sync::{Arc, Barrier};
+
+        let index = 253;
+        let made = Arc::new(Mutex::new(vec![0u64; index as usize + 1]));
+        let version = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let claims = [next_claim_version(&version), next_claim_version(&version)];
+        let descriptor_write = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let barrier = Arc::new(Barrier::new(2));
+        let mut threads = Vec::new();
+        for (id, claim) in [(1u64, claims[0]), (2, claims[1])] {
+            let made = Arc::clone(&made);
+            let version = Arc::clone(&version);
+            let descriptor_write = Arc::clone(&descriptor_write);
+            let barrier = Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                let stripe = mirror_stripe(index);
+                made.lock().unwrap()[index as usize] = 0;
+                drop(stripe);
+                // Both calls now own a deferred (zero) marker; only the
+                // newest claim may publish after they reacquire the stripe.
+                barrier.wait();
+                let _stripe = mirror_stripe(index);
+                if claim_is_current(made.lock().unwrap()[index as usize], 0, &version, claim) {
+                    descriptor_write.store(id, std::sync::atomic::Ordering::Release);
+                }
+            }));
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(descriptor_write.load(std::sync::atomic::Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn stale_cleanup_cannot_clear_a_slot_while_a_mirror_owns_its_stripe() {
+        use std::sync::{Arc, mpsc};
+        use std::time::Duration;
+
+        let index = 17;
+        let made = Arc::new(Mutex::new(vec![0; index as usize + 1]));
+        let version = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let stripe = mirror_stripe(index);
+        made.lock().unwrap()[index as usize] = 0xfeed;
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let thread_made = Arc::clone(&made);
+        let thread_version = Arc::clone(&version);
+        let thread_calls = Arc::clone(&calls);
+        let cleanup = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let applied = with_unclaimed_slot(&thread_made, &thread_version, 0, index, || {
+                thread_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            });
+            done_tx.send(applied).unwrap();
+        });
+
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        // The mirror still owns the slot stripe while it writes its
+        // descriptor; stale cleanup cannot run its descriptor write yet.
+        assert!(done_rx.recv_timeout(Duration::from_millis(20)).is_err());
+        drop(stripe);
+        assert!(!done_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        cleanup.join().unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(made.lock().unwrap()[index as usize], 0xfeed);
+    }
+
+    #[test]
+    fn stale_cleanup_nulls_only_a_still_unclaimed_slot() {
+        let made = Mutex::new(vec![0, 0x1234]);
+        let version = std::sync::atomic::AtomicU64::new(0);
+        let mut cleaned = false;
+        assert!(with_unclaimed_slot(&made, &version, 0, 0, || cleaned = true));
+        assert!(cleaned);
+
+        cleaned = false;
+        assert!(!with_unclaimed_slot(&made, &version, 0, 1, || cleaned = true));
+        assert!(!cleaned);
+    }
+
+    #[test]
+    fn stale_cleanup_skips_a_newer_deferred_claim() {
+        let index = 4;
+        let made = Mutex::new(vec![0; index as usize + 1]);
+        let version = std::sync::atomic::AtomicU64::new(0);
+        let invalidation_version = next_claim_version(&version);
+        // A later mirror claims the slot after the invalidation is queued;
+        // its `made` marker is also zero, so the version must decide.
+        let _newer = next_claim_version(&version);
+        let mut cleaned = false;
+        assert!(!with_unclaimed_slot(&made, &version, invalidation_version, index, || {
+            cleaned = true;
+        }));
+        assert!(!cleaned);
+    }
+
+    #[test]
+    fn opposing_stale_invalidations_release_source_stripes_before_cleanup() {
+        use std::sync::{Arc, Barrier};
+
+        let made = Arc::new(Mutex::new(vec![0x11, 0x22]));
+        let claims = Arc::new([
+            std::sync::atomic::AtomicU64::new(0),
+            std::sync::atomic::AtomicU64::new(0),
+        ]);
+        let at_sources = Arc::new(Barrier::new(2));
+        let after_release = Arc::new(Barrier::new(2));
+        let cleaned = Arc::new([
+            std::sync::atomic::AtomicUsize::new(0),
+            std::sync::atomic::AtomicUsize::new(0),
+        ]);
+        let mut threads = Vec::new();
+        for (source, target) in [(0usize, 1usize), (1, 0)] {
+            let made = Arc::clone(&made);
+            let claims = Arc::clone(&claims);
+            let at_sources = Arc::clone(&at_sources);
+            let after_release = Arc::clone(&after_release);
+            let cleaned = Arc::clone(&cleaned);
+            threads.push(std::thread::spawn(move || {
+                let source_stripe = mirror_stripe(source as u32 + 11);
+                at_sources.wait();
+                let old = std::mem::take(&mut made.lock().unwrap()[target]);
+                let version = next_claim_version(&claims[target]);
+                drop(source_stripe);
+                after_release.wait();
+                assert!(with_unclaimed_slot(&made, &claims[target], version, target as u32, || {
+                    cleaned[target].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }));
+                assert_ne!(old, 0);
+            }));
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(cleaned[0].load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(cleaned[1].load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    /// Exercises real D3D12 descriptor creation from concurrent mirror calls
+    /// on a host device (when one is available), including distinct slots,
+    /// competing claims of one slot and both mirror modes.
+    #[test]
+    fn sampler_descriptors_mirror_concurrently_on_the_host_device() {
+        use std::sync::{Arc, Barrier};
+
+        let Some(heap) = HostHeap::new(true, 3).map(Arc::new) else {
+            eprintln!("no host D3D12 device; concurrent descriptor API exercise skipped");
+            return;
+        };
+        let sampler = || {
+            let mut words = [0u32; 27];
+            words[6..9].copy_from_slice(&[3, 3, 3]);
+            words[10] = 1000.0f32.to_bits();
+            words
+        };
+        let mut records = Vec::new();
+        for i in 0..4 {
+            let mut words = sampler();
+            words[17] = (i as f32 / 1200.0).to_bits();
+            let mut record = Box::new([0u32; 3]);
+            crate::descriptor::record(record.as_mut_ptr() as u64, View::ConsoleSampler(words));
+            records.push(record);
+        }
+        let keys: Vec<_> = records
+            .iter()
+            .map(|record| u64::from(record[1]) | u64::from(record[2]) << 32)
+            .collect();
+        let handles: Vec<_> = records.iter_mut().map(|r| r.as_mut_ptr() as u64).collect();
+        // Exercise the public environment-selected entry point as well; run
+        // this test with and without `LUCIA_MIRROR_UNLOCKED=0`.
+        assert!(heap.mirror(0, handles[0], true).is_some());
+        assert_eq!(heap.made.lock().unwrap()[0], keys[0]);
+        let exercise = |heap: Arc<HostHeap>, unlocked: bool| {
+            let barrier = Arc::new(Barrier::new(2));
+            let mut threads = Vec::new();
+            for (slot, handle) in [(0u32, handles[0]), (1, handles[1])] {
+                let heap = Arc::clone(&heap);
+                let barrier = Arc::clone(&barrier);
+                threads.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    assert!(heap.mirror_with_mode(slot, handle, true, unlocked).is_some());
+                }));
+            }
+            for thread in threads {
+                thread.join().unwrap();
+            }
+            assert_eq!(heap.made.lock().unwrap()[0], keys[0]);
+            assert_eq!(heap.made.lock().unwrap()[1], keys[1]);
+
+            let barrier = Arc::new(Barrier::new(2));
+            let mut threads = Vec::new();
+            for handle in [handles[2], handles[3]] {
+                let heap = Arc::clone(&heap);
+                let barrier = Arc::clone(&barrier);
+                threads.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    assert!(heap.mirror_with_mode(2, handle, true, unlocked).is_some());
+                }));
+            }
+            for thread in threads {
+                thread.join().unwrap();
+            }
+            assert!([keys[2], keys[3]].contains(&heap.made.lock().unwrap()[2]));
+        };
+        exercise(Arc::clone(&heap), true);
+        let fallback = Arc::new(
+            HostHeap::new(true, 3).expect("host descriptor heap for locked fallback"),
+        );
+        exercise(fallback, false);
+    }
+
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.
     #[test]
@@ -2342,6 +2906,92 @@ mod tests {
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 
+    /// Copies a real CPU descriptor into the shader-visible heap and checks
+    /// that residency publishes that exact physical destination. This is a
+    /// D3D12 API integration test, not a shader readback test.
+    #[test]
+    fn resident_copy_uses_the_shared_heap_pool_and_publishes_its_slot() {
+        use super::super::residency::Mapping;
+
+        let host = host().expect("D3D12 device required for descriptor-copy integration test");
+        let heap = HostHeap::new(false, 4).expect("D3D12 view heap");
+        // SAFETY: a CPU-only view heap used as valid D3D12 copy sources.
+        let source_heap: ID3D12DescriptorHeap = unsafe {
+            host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: 2,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+                NodeMask: 0,
+            })
+        }
+        .expect("CPU descriptor heap");
+        let start = unsafe { source_heap.GetCPUDescriptorHandleForHeapStart() };
+        let source0 = start;
+        let source1 = D3D12_CPU_DESCRIPTOR_HANDLE {
+            ptr: start.ptr + heap.step as usize,
+        };
+        let raw = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    NumElements: 1,
+                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                    ..Default::default()
+                },
+            },
+        };
+        let typed = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_UINT,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    NumElements: 1,
+                    ..Default::default()
+                },
+            },
+            ..raw
+        };
+        // SAFETY: a null raw SRV is a legal D3D12 descriptor for this test.
+        unsafe {
+            host.device
+                .CreateShaderResourceView(None, Some(&raw), source0);
+            host.device
+                .CreateShaderResourceView(None, Some(&typed), source1);
+        }
+
+        let physical0 = heap
+            .publish_cpu_descriptor(1, 0x1001, source0, None)
+            .expect("published descriptor");
+        assert!(physical0 >= heap.count && physical0 < heap.count + heap.dynamic);
+        let old = heap.residency_snapshot().expect("view residency");
+        assert_eq!(old.lookup(1), Mapping::Resident(physical0));
+
+        let physical1 = heap
+            .publish_cpu_descriptor(1, 0x1002, source1, None)
+            .expect("replacement descriptor");
+        assert_ne!(physical0, physical1);
+        let current = heap.residency_snapshot().expect("replacement snapshot");
+        assert_eq!(old.lookup(1), Mapping::Resident(physical0));
+        assert_eq!(current.lookup(1), Mapping::Resident(physical1));
+
+        // Root-table relocation allocates from the same pool and therefore
+        // cannot receive the physical slot already held by residency.
+        let relocated = heap.dynamic(1).expect("relocation slot");
+        assert_ne!(relocated, physical0);
+        assert_ne!(relocated, physical1);
+        heap.release(relocated, 1);
+
+        heap.invalidate_resident(1).unwrap();
+        assert_eq!(heap.residency_snapshot().unwrap().lookup(1), Mapping::Unresident);
+        let before_old_drop = heap.slots.free_count();
+        drop(old);
+        assert_eq!(heap.slots.free_count(), before_old_drop + 1);
+        drop(current);
+        assert_eq!(heap.slots.free_count(), before_old_drop + 2);
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
     /// Dynamic slots stay taken until given back, and runs do not wrap.
     #[test]
     fn a_structured_view_made_raw_passes_the_host_check() {
@@ -2416,6 +3066,96 @@ mod tests {
         q.written(98, 14, 16, false);
         assert!(!q.due(15, 100).iter().any(|d| d.0 == 98));
         assert!(q.due(16, 100).iter().any(|d| d.0 == 98));
+    }
+
+    /// A repeatedly unmapped texture cannot consume the whole pass budget
+    /// while never-looked-at slots wait behind it.
+    #[test]
+    fn texture_queue_alternates_retries_and_fresh_slots() {
+        let mut q = TextureQueue::default();
+        for i in 0..8u32 {
+            q.written(100 + i, u64::from(i), 0, false);
+        }
+        // Put the newest write into the retry class.
+        let retry = q.due_with_fairness(10, 100, true)[0].1;
+        q.later(107, retry, 10, 8);
+        let order = q.due_with_fairness(18, 4, true);
+        assert_eq!(order.iter().map(|x| x.0).collect::<Vec<_>>(), [107, 106, 100, 105]);
+    }
+
+    #[test]
+    fn fair_due_setting_defaults_on_and_zero_restores_retry_first() {
+        assert!(fair_due_setting(None));
+        assert!(!fair_due_setting(Some(std::ffi::OsStr::new("0"))));
+        assert!(fair_due_setting(Some(std::ffi::OsStr::new("false"))));
+    }
+
+    /// Fair scheduling preserves the existing newest/oldest fresh ordering
+    /// while interleaving retry work, even across a large backlog.
+    #[test]
+    fn texture_queue_fairness_preserves_selection_and_legacy_mode() {
+        fn full_sort(q: &TextureQueue, frame: u64, max: usize, fair: bool) -> Vec<(u32, u64)> {
+            let mut retry = Vec::new();
+            let mut fresh = Vec::new();
+            for (&slot, w) in q.slots.iter().filter(|(_, w)| w.due <= frame) {
+                let target = if w.looks > 0 || w.mapped > 0 { &mut retry } else { &mut fresh };
+                target.push((w.write, slot, w.write));
+            }
+            retry.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+            fresh.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+            let (mut newer, mut older) = (0, fresh.len());
+            let mut ordered_fresh = Vec::new();
+            while newer < older && ordered_fresh.len() < max {
+                ordered_fresh.push((fresh[newer].1, fresh[newer].2));
+                newer += 1;
+                if newer < older && ordered_fresh.len() < max {
+                    older -= 1;
+                    ordered_fresh.push((fresh[older].1, fresh[older].2));
+                }
+            }
+            let mut out: Vec<_> = retry.into_iter().map(|(_, slot, write)| (slot, write)).collect();
+            if fair {
+                let mut all = Vec::with_capacity(max);
+                let mut retries = out.into_iter();
+                let mut fresh = ordered_fresh.into_iter();
+                while all.len() < max {
+                    let (a, b) = (retries.next(), fresh.next());
+                    if a.is_none() && b.is_none() {
+                        break;
+                    }
+                    all.extend(a);
+                    all.extend(b);
+                }
+                all.truncate(max);
+                all
+            } else {
+                out.extend(ordered_fresh);
+                out.truncate(max);
+                out
+            }
+        }
+
+        let mut q = TextureQueue::default();
+        for slot in 0..40_000u32 {
+            q.written(slot, u64::from(slot), 0, false);
+            if slot % 3 == 0 {
+                let write = q.slots[&slot].write;
+                q.later(slot, write, 0, 1);
+                q.slots.get_mut(&slot).unwrap().due = 0;
+            }
+        }
+        for fair in [false, true] {
+            let expected = full_sort(&q, 1, 4096, fair);
+            let actual = q.due_with_fairness(1, 4096, fair);
+            assert_eq!(actual, expected, "fair mode {fair}");
+            if fair {
+                assert_eq!(actual.iter().filter(|(slot, _)| slot % 3 == 0).count(), 2048);
+                assert_eq!(actual.iter().filter(|(slot, _)| slot % 3 != 0).count(), 2048);
+            } else {
+                assert!(actual.iter().all(|(slot, _)| slot % 3 == 0));
+            }
+            assert_eq!(q.due_with_fairness(1, 0, fair), []);
+        }
     }
 
     /// A view written over memory that older views describe otherwise
