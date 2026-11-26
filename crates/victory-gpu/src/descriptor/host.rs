@@ -42,6 +42,8 @@ pub(crate) struct HostHeap {
     residency: Option<Residency>,
     staging: Option<ID3D12DescriptorHeap>,
     staging_next: Mutex<u32>,
+    /// Overflow descriptors awaiting a host resource or a free residency slot.
+    pending_residency: Mutex<(std::collections::VecDeque<u32>, std::collections::HashSet<u32>)>,
     /// View heaps: the bytes per element of the buffer view at each title
     /// slot, for shaders that pick a buffer by an index they compute
     /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
@@ -801,6 +803,7 @@ impl HostHeap {
             residency,
             staging,
             staging_next: Mutex::new(0),
+            pending_residency: Mutex::new(Default::default()),
             strides,
             buffers: Mutex::default(),
             changed: Mutex::default(),
@@ -900,6 +903,37 @@ fn keep_slot_resource(
 }
 
 impl HostHeap {
+    fn queue_residency(&self, logical: u32) {
+        let mut pending = self.pending_residency.lock().unwrap_or_else(|e| e.into_inner());
+        if pending.1.insert(logical) {
+            pending.0.push_back(logical);
+        }
+    }
+
+    fn complete_residency(&self, logical: u32) {
+        self.pending_residency
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .1
+            .remove(&logical);
+    }
+
+    pub(crate) fn pending_residency(&self, max: usize) -> Vec<u32> {
+        let mut pending = self.pending_residency.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ready = Vec::with_capacity(max.min(pending.0.len()));
+        while ready.len() < max {
+            let Some(logical) = pending.0.pop_front() else { break };
+            if pending.1.remove(&logical) {
+                ready.push(logical);
+            }
+        }
+        ready
+    }
+
+    pub(crate) fn retry_residency(&self, logical: u32) {
+        self.queue_residency(logical);
+    }
+
     /// Tracks an overflow title slot that has no in-place host mirror.
     /// The shader-indexed heap passes use these sets to make its resource
     /// copy ready and retry residency once the underlying host resource exists.
@@ -907,6 +941,7 @@ impl HostHeap {
         if self.sampler || index >= victory_shader::emit::SLOT_REMAP_COUNT {
             return;
         }
+        self.queue_residency(index);
         // SAFETY: the title supplied a descriptor handle in its registered heap.
         let [tag, view_index, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         let view = (tag == VIEW_TAG)
@@ -941,7 +976,7 @@ impl HostHeap {
         let record = u64::from(generation) << 32 | u64::from(view_index);
         let identity = (u128::from(logical) << 64) | u128::from(record);
 
-        residency.map_with(logical, identity, |physical| {
+        let result = residency.map_with(logical, identity, |physical| {
             let staging = self
                 .staging
                 .as_ref()
@@ -966,7 +1001,11 @@ impl HostHeap {
             self.copy_descriptor_to_physical(physical, source, retained)?;
             drop(next);
             Ok(())
-        })
+        });
+        if result.is_ok() {
+            self.complete_residency(logical);
+        }
+        result
     }
 
     /// Makes a logical descriptor resident by copying the already
@@ -995,7 +1034,11 @@ impl HostHeap {
             .unwrap_or_else(|e| e.into_inner())
             .get(source_index as usize)
             .and_then(Clone::clone);
-        self.publish_cpu_descriptor(logical, identity, self.cpu(source_index), resource)
+        let result = self.publish_cpu_descriptor(logical, identity, self.cpu(source_index), resource);
+        if result.is_ok() {
+            self.complete_residency(logical);
+        }
+        result
     }
 
     /// Publishes a descriptor already made in a CPU heap. This is shared by
