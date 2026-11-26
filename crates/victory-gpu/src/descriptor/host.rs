@@ -357,6 +357,7 @@ impl TextureQueue {
     ///   25,000-40,000 while the textures of the shot on screen waited
     ///   (run 52: 98% of the drawn pixels had no colour texture in the
     ///   first 3D frames).
+    ///
     /// Fair retry/fresh interleaving follows VICTORY-NVIDIA commit
     /// `77e13a974aed142f5d9f8b80d54ed6de41bfa140` (GPL-3.0).
     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
@@ -894,8 +895,7 @@ fn keep_slot_resource(
     let old = {
         let mut kept = kept.lock().unwrap_or_else(|e| e.into_inner());
         kept.get_mut(index as usize)
-            .map(|slot| std::mem::replace(slot, resource))
-            .flatten()
+            .and_then(|slot| std::mem::replace(slot, resource))
     };
     if let Some(old) = old {
         crate::host::retire(old);
@@ -1064,24 +1064,6 @@ impl HostHeap {
             self.complete_residency(logical);
         }
         result
-    }
-
-    /// Publishes a descriptor already made in a CPU heap. This is shared by
-    /// the view materializer and its D3D12 integration test.
-    fn publish_cpu_descriptor(
-        &self,
-        logical: u32,
-        identity: u128,
-        source: D3D12_CPU_DESCRIPTOR_HANDLE,
-        resource: Option<ID3D12Resource>,
-    ) -> Result<u32, super::residency::ResidencyError> {
-        let residency = self
-            .residency
-            .as_ref()
-            .ok_or(super::residency::ResidencyError::DescriptorCopyFailed)?;
-        residency.map_with(logical, identity, |physical| {
-            self.copy_descriptor_to_physical(physical, source, resource.clone())
-        })
     }
 
     fn copy_descriptor_to_physical(
@@ -3232,8 +3214,8 @@ mod tests {
                 let target = if w.looks > 0 || w.mapped > 0 { &mut retry } else { &mut fresh };
                 target.push((w.write, slot, w.write));
             }
-            retry.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-            fresh.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+            retry.sort_unstable_by_key(|a| std::cmp::Reverse(a.0));
+            fresh.sort_unstable_by_key(|a| std::cmp::Reverse(a.0));
             let (mut newer, mut older) = (0, fresh.len());
             let mut ordered_fresh = Vec::new();
             while newer < older && ordered_fresh.len() < max {
