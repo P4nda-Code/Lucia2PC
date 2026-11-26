@@ -2351,30 +2351,6 @@ impl State {
                         readable(list, kind, &view);
                     }
                 }
-                if direct_heap {
-                    let heap_id = std::ptr::from_ref(heap) as usize;
-                    for k in 0..n {
-                        let used = entries.iter().any(|u| u.table_offset_dwords / 8 == k);
-                        if !used && selected.binary_search(&k).is_err() {
-                            continue;
-                        }
-                        let title_handle = table + u64::from(k) * 32;
-                        if let Some(logical) = heap.index(title_handle)
-                            && logical >= host.count()
-                            && let Some(view) = crate::descriptor::view(title_handle)
-                            && host
-                                .make_resident_from_host_slot(
-                                    logical,
-                                    title_handle,
-                                    first + k,
-                                    &view,
-                                )
-                                .is_ok()
-                        {
-                            resident_heap = Some(heap_id);
-                        }
-                    }
-                }
                 made.push((slot, first * 32));
                 continue;
             }
