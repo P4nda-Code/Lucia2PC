@@ -1164,11 +1164,11 @@ impl State {
             list.keep(&p.pso);
             list.keep(&p.root);
         }
-        if p.stages.iter().any(|stage| stage.translated().uses_resource_heap)
-            && self.heap_buffers(list).is_none()
-        {
-            once!("a direct ResourceHeap shader has no host view-heap mapping resources; the draw is dropped");
-            return false;
+        if p.stages.iter().any(|stage| stage.translated().uses_resource_heap) {
+            // Run the heap-wide preparation pass before taking the immutable
+            // mapping snapshot. Its stride table is optional for shaders
+            // that use ResourceHeap without structured-buffer accesses.
+            let _ = self.heap_buffers(list);
         }
         for stage in &p.stages {
             let t = stage.translated();
