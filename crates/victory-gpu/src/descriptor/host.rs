@@ -624,17 +624,17 @@ fn mirror_unlocked() -> bool {
     *ON.get_or_init(|| mirror_unlocked_setting(std::env::var_os("LUCIA_MIRROR_UNLOCKED").as_deref()))
 }
 
-/// Asks the host, once, whether it caps view heaps at [`PORTABLE_VIEWS`],
-/// and if so tells the translator now (`set_view_heap_limit`) instead of
-/// when the title's heap is made: a shader keeps the limit it was
-/// translated with, and the title makes 25 pipelines (their
-/// shaders translated at once) before it makes its view heap. Those would
-/// read a view index past the heap unclamped, the read that hangs NVIDIA.
-/// Called before a shader is translated.
+/// Asks the host, once, whether it can allocate the GTA VI view heap
+/// plus the relocation reserve (1,507,328 descriptors), and if not tells
+/// the translator now (`set_view_heap_limit`) instead of when the title's
+/// heap is made: shaders keep the limit they were translated with, and the
+/// title makes pipelines before it creates the heap. Called before a shader
+/// is translated.
 /// shortcut: the limit is the capped heap's last slot whatever size the
 /// title's heap turns out to have; a heap that fits is not capped and
 /// keeps no null slot there (an index past it is as undefined as before).
 pub(crate) fn probe_view_limit() {
+    const TITLE_HEAP_AND_RESERVE: u32 = 1_507_329;
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let Some(host) = host() else { return };
@@ -643,13 +643,13 @@ pub(crate) fn probe_view_limit() {
             host.device
                 .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                     Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                    NumDescriptors: PORTABLE_VIEWS + 1,
+                    NumDescriptors: TITLE_HEAP_AND_RESERVE,
                     Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                     NodeMask: 0,
                 })
         };
         if made.is_err() {
-            tracing::info!("the host caps view heaps at {PORTABLE_VIEWS}: view indices are clamped from the first shader on");
+            tracing::info!("the host cannot allocate the title-sized view heap: direct ResourceHeap indices use residency remapping from the first shader on");
             victory_shader::emit::set_view_heap_limit(PORTABLE_VIEWS - 1);
         }
     });
