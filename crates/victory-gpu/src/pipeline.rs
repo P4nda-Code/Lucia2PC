@@ -294,12 +294,28 @@ pub(crate) fn builder_runs() -> bool {
     if b.whole {
         return true;
     }
-    let missing = b.pipelines.iter().filter(|p| !make::now(p)).count();
+    let failures: Vec<String> = b
+        .pipelines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, pipeline)| {
+            if make::now(pipeline) {
+                None
+            } else {
+                Some(format!(
+                    "#{index}: {}",
+                    make::missing(pipeline).unwrap_or_else(|| "host pipeline unavailable".into())
+                ))
+            }
+        })
+        .collect();
+    let missing = failures.len();
     if missing > 0 {
         b.off = true;
         tracing::warn!(
             missing,
             of = b.pipelines.len(),
+            failures = ?failures,
             "the ray-tracing structure builder stays off: not all of its programs have a host pipeline, and its stages run all or none"
         );
         return false;
