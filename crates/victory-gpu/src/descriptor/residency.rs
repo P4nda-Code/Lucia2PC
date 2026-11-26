@@ -8,13 +8,6 @@ use std::sync::{Arc, Mutex};
 pub(crate) const UNMAPPED_DESCRIPTOR: u32 = u32::MAX;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Mapping {
-    Resident(u32),
-    Unresident,
-    Invalid,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ResidencyError {
     InvalidLogicalIndex,
     CapacityExhausted,
@@ -125,10 +118,6 @@ impl PhysicalSlots {
         if state.free >= count {
             state.too_long = state.too_long.min(count);
         }
-    }
-
-    pub(crate) fn free_count(&self) -> u32 {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).free
     }
 
 }
@@ -335,10 +324,6 @@ impl MappingSnapshot {
         self.lease.version
     }
 
-    pub(crate) fn encoded(&self) -> &[u32] {
-        &self.lease.map
-    }
-
     /// Copies the complete logical-to-physical table into a GPU upload
     /// mapping. The caller must keep this snapshot alive until the GPU has
     /// finished reading the copied table, so its physical descriptor slots
@@ -357,14 +342,6 @@ impl MappingSnapshot {
         }
         destination[..required].copy_from_slice(&self.lease.map);
         Ok(())
-    }
-
-    pub(crate) fn lookup(&self, logical: u32) -> Mapping {
-        match self.lease.map.get(logical as usize) {
-            Some(&UNMAPPED_DESCRIPTOR) => Mapping::Unresident,
-            Some(&physical) => Mapping::Resident(physical),
-            None => Mapping::Invalid,
-        }
     }
 
     pub(crate) fn physical_slots(&self) -> &[u32] {
