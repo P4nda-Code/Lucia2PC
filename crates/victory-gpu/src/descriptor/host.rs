@@ -941,7 +941,6 @@ impl HostHeap {
         if self.sampler || index >= victory_shader::emit::SLOT_REMAP_COUNT {
             return;
         }
-        self.queue_residency(index);
         // SAFETY: the title supplied a descriptor handle in its registered heap.
         let [tag, view_index, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         let view = (tag == VIEW_TAG)
@@ -951,6 +950,7 @@ impl HostHeap {
         for slot in stale {
             let _ = self.invalidate_resident(slot);
         }
+        self.queue_residency(index);
     }
 
     /// Copies the current title descriptor into a slot owned by the shared
