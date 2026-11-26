@@ -1086,10 +1086,15 @@ impl HostHeap {
         &self,
         logical: u32,
     ) -> Result<(), super::residency::ResidencyError> {
-        self.residency
+        let result = self
+            .residency
             .as_ref()
             .ok_or(super::residency::ResidencyError::InvalidLogicalIndex)?
-            .invalidate(logical)
+            .invalidate(logical);
+        if result.is_ok() {
+            self.complete_residency(logical);
+        }
+        result
     }
 
     pub(crate) fn residency_version(&self) -> Option<u64> {
