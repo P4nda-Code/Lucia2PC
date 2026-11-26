@@ -203,6 +203,16 @@ pub(crate) fn make_resident(
         .make_resident(logical, handle)
 }
 
+/// Current generation of a title heap's logical-to-physical mapping.
+#[cfg(windows)]
+pub(crate) fn residency_version(heap: usize) -> Option<u64> {
+    if heap == 0 {
+        return None;
+    }
+    // SAFETY: only registered title heaps are passed by draw state.
+    unsafe { &*(heap as *const Heap) }.host()?.residency_version()
+}
+
 /// Takes an immutable mapping snapshot for a command-list submission.
 #[cfg(windows)]
 pub(crate) fn residency_snapshot(heap: usize) -> Option<residency::MappingSnapshot> {
