@@ -2,7 +2,7 @@
 //! the `dx.op` declarations it calls, its signatures and bound resources,
 //! and the metadata and container that wrap it up (SM 6.6, validator 1.6).
 
-use super::bitcode::{Attr, Md, Module, Ty, V};
+use super::bitcode::{Attr, Cast, Md, Module, Ty, V, pred};
 use super::container::{self, Binding, Psv, SigElement};
 
 /// Where the shader reads its user data: `b0` in this space.
@@ -26,6 +26,15 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 pub const SLOT_STRIDES: u8 = 255;
 /// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
 pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
+
+/// The root SRV `t<SLOT_REMAP>` in [`ROOT_CBV_SPACE`] holds the logical
+/// view-heap index to physical host-heap index table. The table has a fixed
+/// size so every translated direct-heap access can be bounded before loading
+/// it. Unresident entries contain `u32::MAX` and resolve to the host null
+/// descriptor. The host prefix is represented by identity entries.
+pub const SLOT_REMAP: u8 = 252;
+/// Dwords in the fixed-size direct-index remapping table.
+pub const SLOT_REMAP_COUNT: u32 = 1 << 21;
 
 /// Title memory by address (`resource::MEMORY`): console code reads and
 /// writes through raw 40-bit addresses it takes from root constants,
@@ -407,22 +416,46 @@ impl Shader {
         nonuniform: bool,
         props: (u32, u32),
     ) -> V {
-        // a view index past the host heap (`set_view_heap_limit`) reads its null slot instead
+        // On a capped host, translate the title's logical view index
+        // through a per-list table. The mirrored prefix maps to itself;
+        // resident overflow descriptors map into the shared dynamic pool;
+        // every other overflow entry maps to the dedicated null slot.
         let limit = VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed);
-        // (as `dx.op.binary` UMin: a compare and select emitted here made the bitcode invalid)
         let index = if !sampler && limit != 0 {
-            let null = self.m.i32(limit);
-            let i32t = self.t.i32;
-            let v = self.op(
+            let last = self.m.i32(SLOT_REMAP_COUNT - 1);
+            let logical = self.op(
                 block,
                 "binary.i32",
                 Attr::ReadNone,
-                i32t,
+                self.t.i32,
                 40,
-                &[index, null],
+                &[index, last],
             );
-            self.m.tag(v, super::bitcode::Tag::Clamp);
-            v
+            self.m.tag(logical, super::bitcode::Tag::Clamp);
+            let table = self.root_srv_handle(SLOT_REMAP);
+            let four = self.m.i32(2);
+            let byte = self.m.bin(block, super::bitcode::Bin::Shl, logical, four);
+            let undef = self.m.undef(self.t.i32);
+            let mask = self.m.i8(1);
+            let align = self.m.i32(4);
+            let loaded = self.op(
+                block,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                self.t.res_ret,
+                139,
+                &[table, byte, undef, mask, align],
+            );
+            let value = self.m.extract(block, loaded, 0);
+            let physical = self.m.cast(block, Cast::Bitcast, value, self.t.i32);
+            let missing = self.m.cmp(
+                block,
+                pred::EQ,
+                physical,
+                self.m.i32(u32::MAX),
+            );
+            let null = self.m.i32(limit);
+            self.m.select(block, missing, null, physical)
         } else if sampler {
             // A sampler heap has at most 2,048 samplers on any host: an
             // index past that (a number read from memory the host has not
