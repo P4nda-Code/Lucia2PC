@@ -2411,7 +2411,10 @@ impl State {
                     && logical >= host.count()
                 {
                     let heap_id = std::ptr::from_ref(heap) as usize;
-                    if crate::descriptor::make_resident(heap_id, logical, title_handle).is_ok() {
+                    if host
+                        .make_resident_from_host_slot(logical, title_handle, index)
+                        .is_ok()
+                    {
                         resident_heap = Some(heap_id);
                     }
                 }
