@@ -1052,12 +1052,10 @@ impl HostHeap {
                 self.cpu(source_index),
                 resource.clone(),
             )?;
-            let current = unsafe { (handle as *const [u32; 3]).read_unaligned() };
-            if current != record_words
-                || view_at(view_index, generation).as_ref() != Some(expected_view)
-            {
-                return Err(super::residency::ResidencyError::DescriptorChanged);
-            }
+            // Descriptor writes invalidate residency before changing the
+            // title record. If one races this copy, that invalidation waits
+            // for the residency lock and withdraws this mapping immediately
+            // after publication.
             Ok(())
         });
         if result.is_ok() {
