@@ -933,3 +933,22 @@ impl Shader {
         Some(self.m.md_node(list))
     }
 }
+
+#[cfg(test)]
+mod residency_tests {
+    use super::{SLOT_REMAP, Shader, set_view_heap_limit};
+
+    #[test]
+    fn capped_direct_heap_access_adds_the_residency_root_srv() {
+        set_view_heap_limit(999_999);
+        let mut shader = Shader::new(false);
+        let logical = shader.m.i32(17);
+        let _ = shader.heap_handle(shader.entry, logical, false, false, (0, 0));
+        assert!(
+            shader.root_srvs.iter().any(|(slot, _)| *slot == SLOT_REMAP),
+            "a capped ResourceHeap access must bind its logical-to-physical map"
+        );
+
+        set_view_heap_limit(0);
+    }
+}
