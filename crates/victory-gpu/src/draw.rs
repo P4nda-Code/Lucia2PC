@@ -226,23 +226,6 @@ impl Drop for State {
 }
 
 impl State {
-    /// Makes one logical descriptor resident and retains the resulting
-    /// immutable map for this recording. A translated shader path must use
-    /// the returned physical slot through the matching snapshot.
-    pub(crate) fn make_resident(
-        &mut self,
-        heap: usize,
-        logical: u32,
-        handle: u64,
-    ) -> Result<u32, crate::descriptor::residency::ResidencyError> {
-        self.residency_gpu = None;
-        let physical = crate::descriptor::make_resident(heap, logical, handle)?;
-        let snapshot = crate::descriptor::residency_snapshot(heap)
-            .ok_or(crate::descriptor::residency::ResidencyError::DescriptorCopyFailed)?;
-        self.residency.push(snapshot);
-        Ok(physical)
-    }
-
     /// Uploads one fixed-size immutable mapping table for this command
     /// list. Its snapshot pins every dynamic descriptor slot referenced by
     /// the table until the submission completes.
@@ -284,15 +267,6 @@ impl State {
         self.residency.push(snapshot);
         self.residency_gpu = Some((heap, version, gpu));
         Some(gpu)
-    }
-
-    /// Retains a mapping for commands recorded on this list. The detached
-    /// state holds it through the existing queue completion boundary.
-    pub(crate) fn retain_residency(
-        &mut self,
-        snapshot: crate::descriptor::residency::MappingSnapshot,
-    ) {
-        self.residency.push(snapshot);
     }
 
     /// The list's submission has run (submissions are waited for): the
