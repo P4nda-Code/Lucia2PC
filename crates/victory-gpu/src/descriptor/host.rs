@@ -969,6 +969,35 @@ impl HostHeap {
         })
     }
 
+    /// Makes a logical descriptor resident by copying the already
+    /// materialized host table slot. This also covers descriptors whose
+    /// host form depends on per-list upload data (notably constant buffers),
+    /// which cannot always be rebuilt from the title address alone.
+    pub(crate) fn make_resident_from_host_slot(
+        &self,
+        logical: u32,
+        handle: u64,
+        source_index: u32,
+    ) -> Result<u32, super::residency::ResidencyError> {
+        if source_index < self.count || source_index >= self.count + self.dynamic {
+            return Err(super::residency::ResidencyError::InvalidLogicalIndex);
+        }
+        // SAFETY: the title supplied a live descriptor handle in its heap.
+        let [tag, view_index, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        if tag != VIEW_TAG || view_at(view_index, generation).is_none() {
+            return Err(super::residency::ResidencyError::DescriptorCopyFailed);
+        }
+        let record = u64::from(generation) << 32 | u64::from(view_index);
+        let identity = (u128::from(logical) << 64) | u128::from(record);
+        let resource = self
+            .kept
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(source_index as usize)
+            .and_then(Clone::clone);
+        self.publish_cpu_descriptor(logical, identity, self.cpu(source_index), resource)
+    }
+
     /// Publishes a descriptor already made in a CPU heap. This is shared by
     /// the view materializer and its D3D12 integration test.
     fn publish_cpu_descriptor(
