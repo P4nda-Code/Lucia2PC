@@ -694,30 +694,37 @@ impl HostHeap {
             return None;
         };
         let logical_count = count;
-        let (heap, count, size) = match make(requested) {
-            Ok(heap) => (heap, count, requested),
-            Err(e) if !sampler && requested > PORTABLE_VIEWS => {
-                // Root descriptor tables beyond this physical title prefix
-                // are copied into `dynamic` slots and their root offsets are
-                // patched per draw. SM 6.6 ResourceHeap indices cannot use
-                // that path and are rejected by State::bind when this heap is
-                // incomplete. Keep the final physical slot null for invalid
-                // indices; do not represent it as a valid title slot.
-                tracing::warn!(
-                    error = %e,
-                    title_count = count,
-                    dynamic_reserve = extra,
-                    requested,
-                    conservative_limit = PORTABLE_VIEWS,
-                    "view heap is partially virtualized: overflowing root tables are relocated; direct ResourceHeap access requires a complete host heap"
-                );
-                victory_shader::emit::set_view_heap_limit(PORTABLE_VIEWS - 1);
-                let title_slots = PORTABLE_VIEWS - extra - 1;
-                (make(PORTABLE_VIEWS).ok()?, title_slots, PORTABLE_VIEWS)
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, count, requested, sampler, "no host descriptor heap");
-                return None;
+        let remapping = !sampler && victory_shader::emit::view_heap_limit() != 0;
+        let (heap, count, size) = if remapping {
+            // The shader's unmapped-entry fallback is the final physical
+            // descriptor. Keep that slot valid even when this particular
+            // title heap would otherwise fit in a smaller allocation.
+            let title_slots = count.min(PORTABLE_VIEWS - extra - 1);
+            (make(PORTABLE_VIEWS).ok()?, title_slots, PORTABLE_VIEWS)
+        } else {
+            match make(requested) {
+                Ok(heap) => (heap, count, requested),
+                Err(e) if !sampler && requested > PORTABLE_VIEWS => {
+                    // Root descriptor tables beyond this physical title
+                    // prefix are relocated into the shared dynamic pool.
+                    // If the early probe did not enable shader remapping,
+                    // direct ResourceHeap draws remain fail-closed.
+                    tracing::warn!(
+                        error = %e,
+                        title_count = count,
+                        dynamic_reserve = extra,
+                        requested,
+                        conservative_limit = PORTABLE_VIEWS,
+                        "view heap is partially virtualized; direct ResourceHeap access is unavailable"
+                    );
+                    victory_shader::emit::set_view_heap_limit(PORTABLE_VIEWS - 1);
+                    let title_slots = PORTABLE_VIEWS - extra - 1;
+                    (make(PORTABLE_VIEWS).ok()?, title_slots, PORTABLE_VIEWS)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, count, requested, sampler, "no host descriptor heap");
+                    return None;
+                }
             }
         };
         // SAFETY: a live heap.
@@ -732,7 +739,7 @@ impl HostHeap {
         let gpu = unsafe { heap.GetGPUDescriptorHandleForHeapStart().ptr };
         GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner()).push((
             gpu,
-            u64::from(count + extra) * u64::from(step),
+            u64::from(size) * u64::from(step),
             u64::from(step),
             sampler,
         ));
