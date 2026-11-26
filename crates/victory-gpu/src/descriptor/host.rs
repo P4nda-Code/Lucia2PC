@@ -893,6 +893,24 @@ fn keep_slot_resource(
 }
 
 impl HostHeap {
+    /// Tracks an overflow title slot that has no in-place host mirror.
+    /// The shader-indexed heap passes use these sets to make its resource
+    /// copy ready and retry residency once the underlying host resource exists.
+    pub(crate) fn note_overflow(&self, index: u32, handle: u64) {
+        if self.sampler || index >= victory_shader::emit::SLOT_REMAP_COUNT {
+            return;
+        }
+        // SAFETY: the title supplied a descriptor handle in its registered heap.
+        let [tag, view_index, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        let view = (tag == VIEW_TAG)
+            .then(|| view_at(view_index, generation))
+            .flatten();
+        let stale = self.note_buffer(index, view.as_ref(), false);
+        for slot in stale {
+            let _ = self.invalidate_resident(slot);
+        }
+    }
+
     /// Copies the current title descriptor into a slot owned by the shared
     /// physical pool and publishes its logical mapping only after the copy.
     /// `handle` identifies a live descriptor record, including its generation.
