@@ -1703,6 +1703,15 @@ impl State {
             shadow.refresh(list, *from, to - from);
         }
         self.heap_textures(list, heap, host);
+        // Retry other overflow descriptor kinds (constant buffers and UAVs
+        // in particular) after the buffer and texture preparation passes.
+        for index in host.pending_residency(4096) {
+            if let Some(handle) = heap.handle(index)
+                && host.make_resident(index, handle).is_err()
+            {
+                host.retry_residency(index);
+            }
+        }
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
         HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         static LOGGED: AtomicU64 = AtomicU64::new(0);
