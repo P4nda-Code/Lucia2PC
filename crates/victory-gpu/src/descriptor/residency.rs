@@ -328,7 +328,10 @@ impl MappingSnapshot {
     /// Returns the required dword count without modifying the destination
     /// when it is too short. Any destination tail beyond the logical heap
     /// is left untouched.
-    pub(crate) fn copy_encoded_to(&self, destination: &mut [u32]) -> Result<(), usize> {
+        // The GPU upload path is not wired into production yet; keep this tested helper
+    // available for that integration without making the current strict CI fail.
+    #[allow(dead_code)]
+pub(crate) fn copy_encoded_to(&self, destination: &mut [u32]) -> Result<(), usize> {
         let required = self.lease.map.len();
         if destination.len() < required {
             return Err(required);
