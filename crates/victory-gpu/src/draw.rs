@@ -212,6 +212,9 @@ pub(crate) struct State {
     /// host submission has completed, so these leases cannot recycle their
     /// physical slots while the GPU may still read them.
     residency: Vec<crate::descriptor::residency::MappingSnapshot>,
+    /// GPU address of this list's immutable direct-index map upload, keyed
+    /// by the title view heap. The upload is retained by HostList scratch.
+    residency_gpu: Option<(usize, u64)>,
 }
 
 impl Drop for State {
@@ -232,11 +235,49 @@ impl State {
         logical: u32,
         handle: u64,
     ) -> Result<u32, crate::descriptor::residency::ResidencyError> {
+        self.residency_gpu = None;
         let physical = crate::descriptor::make_resident(heap, logical, handle)?;
         let snapshot = crate::descriptor::residency_snapshot(heap)
             .ok_or(crate::descriptor::residency::ResidencyError::DescriptorCopyFailed)?;
         self.residency.push(snapshot);
         Ok(physical)
+    }
+
+    /// Uploads one fixed-size immutable mapping table for this command
+    /// list. Its snapshot pins every dynamic descriptor slot referenced by
+    /// the table until the submission completes.
+    fn residency_map_gpu(&mut self, list: &HostList) -> Option<u64> {
+        let heap = self.heaps[0];
+        if heap == 0 {
+            return None;
+        }
+        if let Some((cached_heap, gpu)) = self.residency_gpu
+            && cached_heap == heap
+        {
+            return Some(gpu);
+        }
+        let snapshot = crate::descriptor::residency_snapshot(heap)?;
+        let dwords = victory_shader::emit::SLOT_REMAP_COUNT;
+        if snapshot.logical_count() > dwords {
+            once!(
+                logical = snapshot.logical_count(),
+                capacity = dwords,
+                "direct-index residency map exceeds the shader table"
+            );
+            return None;
+        }
+        let bytes = u64::from(dwords) * 4;
+        let (gpu, data) = list.scratch(bytes)?;
+        // SAFETY: HostList scratch returns a live, writable upload mapping
+        // of at least the requested byte length, aligned to 256 bytes.
+        let table = unsafe {
+            std::slice::from_raw_parts_mut(data.cast::<u32>(), dwords as usize)
+        };
+        table.fill(crate::descriptor::residency::UNMAPPED_DESCRIPTOR);
+        snapshot.copy_encoded_to(table).ok()?;
+        self.residency.push(snapshot);
+        self.residency_gpu = Some((heap, gpu));
+        Some(gpu)
     }
 
     /// Retains a mapping for commands recorded on this list. The detached
@@ -256,7 +297,11 @@ impl State {
     /// shortcut: a list the title runs a second time without a reset then
     /// reads slots others may have taken (logged once).
     pub(crate) fn tables_done(&mut self) {
-        if self.tables_gone && self.dynamic.is_empty() && self.residency.is_empty() {
+        if self.tables_gone
+            && self.dynamic.is_empty()
+            && self.residency.is_empty()
+            && self.residency_gpu.is_none()
+        {
             return;
         }
         if self.tables_gone {
@@ -270,6 +315,7 @@ impl State {
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
         self.residency.clear();
+        self.residency_gpu = None;
         self.tables_gone = true;
     }
 }
@@ -1163,6 +1209,22 @@ impl State {
                                 } else {
                                     l.SetGraphicsRootShaderResourceView(param, m.directory);
                                 }
+                            }
+                        }
+                        continue;
+                    }
+                    if srv && slot == victory_shader::emit::SLOT_REMAP {
+                        let Some(gpu) = self.residency_map_gpu(list) else {
+                            once!("a direct ResourceHeap shader has no residency map upload; the draw is dropped");
+                            return false;
+                        };
+                        // SAFETY: an open list; HostList scratch owns the
+                        // upload buffer through this list's completion.
+                        unsafe {
+                            if compute {
+                                l.SetComputeRootShaderResourceView(param, gpu);
+                            } else {
+                                l.SetGraphicsRootShaderResourceView(param, gpu);
                             }
                         }
                         continue;
