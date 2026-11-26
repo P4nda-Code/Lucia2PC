@@ -1088,12 +1088,24 @@ impl State {
                     .filter(|stage| stage.translated().uses_resource_heap)
                     .map(|stage| (stage.shader.stage, stage.shader.hash.as_str()))
                     .collect::<Vec<_>>();
-                if victory_shader::emit::view_heap_limit() == 0 {
+                let remapped = p
+                    .stages
+                    .iter()
+                    .filter(|stage| stage.translated().uses_resource_heap)
+                    .all(|stage| {
+                        stage
+                            .translated()
+                            .host
+                            .root_srvs
+                            .iter()
+                            .any(|(slot, _)| *slot == victory_shader::emit::SLOT_REMAP)
+                    });
+                if !remapped {
                     once!(
                         logical = title_heap.count(),
                         physical = host_heap.count(),
                         ?shaders,
-                        "direct ResourceHeap access has no shader-side remapping; the draw is dropped to prevent an out-of-bounds heap read"
+                        "direct ResourceHeap access was translated before residency remapping was enabled; the draw is dropped to prevent an out-of-bounds heap read"
                     );
                     return false;
                 }
