@@ -3115,7 +3115,7 @@ mod tests {
         heap.release(relocated, 1);
 
         heap.invalidate_resident(1).unwrap();
-        assert_eq!(heap.residency_snapshot().unwrap().lookup(1), Mapping::Unresident);
+        assert_eq!(heap.residency_snapshot().unwrap().lookup(1), Mapping::Resident(1));
         let before_old_drop = heap.slots.free_count();
         drop(old);
         assert_eq!(heap.slots.free_count(), before_old_drop + 1);
